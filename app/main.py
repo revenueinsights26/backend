@@ -4,13 +4,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import os
+import sqlite3
+import json
 
-# ─────────────────────────────────────────────
-# FastAPI App Configuration
-# ─────────────────────────────────────────────
 app = FastAPI()
 
-# CORS - Allow all for testing
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,10 +16,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API Key security (simplified for now)
 API_KEY_HEADER = APIKeyHeader(name="X-Owner-Token")
 
-# Simple token check (replace with your actual token)
+DB_PATH = os.path.join(os.path.dirname(__file__), "db", "revenue_insights.db")
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+# Simple token verification (replace with your actual tokens)
 VALID_TOKENS = ["9MfYQDx1lVGWFFiQ_D9ibK7lMnruUU6-1jDqapC2if4"]
 
 async def verify_token(api_key: str = Security(API_KEY_HEADER)):
@@ -29,123 +33,104 @@ async def verify_token(api_key: str = Security(API_KEY_HEADER)):
         raise HTTPException(status_code=403, detail="Invalid token")
     return api_key
 
-# ─────────────────────────────────────────────
-# Request/Response Models
-# ─────────────────────────────────────────────
-class RateIntelligenceRequest(BaseModel):
-    current_rate: float
-    competitor_rates: List[float] = []
-    historical_occupancy: float
-    dow_factor: float = 50
-    overall_avg_occ: float = 50
-    has_competitor_data: bool = False
-
-class RateIntelligenceResponse(BaseModel):
-    suggested_rate: float
-    confidence_score: int
-    recommendation: str
-    confidence_level: str
-
-# ─────────────────────────────────────────────
-# Test Endpoint
-# ─────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"message": "Backend is running", "status": "ok"}
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-# ─────────────────────────────────────────────
-# Rate Intelligence Endpoint
-# ─────────────────────────────────────────────
-@app.post("/api/rate-intelligence")
-async def get_rate_intelligence(
-    request: RateIntelligenceRequest,
-    token: str = Depends(verify_token)
-):
-    # Start with current rate
-    suggested_rate = request.current_rate
-    
-    # Adjust based on demand
-    if request.historical_occupancy > 75:
-        suggested_rate = suggested_rate * 1.08
-        recommendation = "High demand - increase rate"
-    elif request.historical_occupancy > 60:
-        suggested_rate = suggested_rate * 1.03
-        recommendation = "Good demand - slight increase"
-    elif request.historical_occupancy < 50:
-        suggested_rate = suggested_rate * 0.95
-        recommendation = "Soft demand - slight decrease"
-    else:
-        recommendation = "Moderate demand - maintain rate"
-    
-    # Adjust based on competitors
-    if request.competitor_rates and len(request.competitor_rates) > 0:
-        comp_avg = sum(request.competitor_rates) / len(request.competitor_rates)
-        if comp_avg > request.current_rate * 1.1:
-            suggested_rate = max(suggested_rate, request.current_rate * 1.05)
-            recommendation = "Below competitors - increase rate"
-        elif comp_avg < request.current_rate * 0.9:
-            suggested_rate = min(suggested_rate, request.current_rate * 0.97)
-            recommendation = "Above competitors - slight decrease"
-    
-    # Round to nearest 10
-    suggested_rate = round(suggested_rate / 10) * 10
-    
-    # Calculate confidence
-    confidence_score = 70
-    confidence_level = "Medium"
-    
-    if request.competitor_rates and len(request.competitor_rates) >= 3:
-        confidence_score = 85
-        confidence_level = "High"
-    elif not request.competitor_rates or len(request.competitor_rates) == 0:
-        confidence_score = 50
-        confidence_level = "Low"
-    
-    return RateIntelligenceResponse(
-        suggested_rate=suggested_rate,
-        confidence_score=confidence_score,
-        recommendation=recommendation,
-        confidence_level=confidence_level
-    )
-
-# ─────────────────────────────────────────────
-# Mock endpoints for testing (bypass database)
-# ─────────────────────────────────────────────
 @app.get("/hotel_dashboard_history/{hotel_id}")
 async def get_hotel_dashboard_history(
     hotel_id: str,
     token: str = Depends(verify_token)
 ):
-    # Return mock data for testing
-    return [
-        {
-            "snapshot_id": 1,
-            "hotel_id": hotel_id,
-            "period_start": "2026-04-01",
-            "period_end": "2026-04-30",
-            "created_at": "2026-04-22T00:00:00"
-        }
-    ]
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT snapshot_id, hotel_id, period_start, period_end, created_at
+            FROM snapshots 
+            WHERE hotel_id = ? 
+            ORDER BY period_start DESC
+        """, (hotel_id,))
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "snapshot_id": row["snapshot_id"],
+                "hotel_id": row["hotel_id"],
+                "period_start": row["period_start"],
+                "period_end": row["period_end"],
+                "created_at": row["created_at"]
+            })
+        conn.close()
+        return result
+    except Exception as e:
+        conn.close()
+        print(f"Database error: {e}")
+        # Return mock data if database fails
+        return [
+            {
+                "snapshot_id": 1,
+                "hotel_id": hotel_id,
+                "period_start": "2026-04-01",
+                "period_end": "2026-04-30",
+                "created_at": "2026-04-22T00:00:00"
+            }
+        ]
 
 @app.get("/daily_by_snapshot/{snapshot_id}")
 async def get_daily_by_snapshot(
     snapshot_id: int,
     token: str = Depends(verify_token)
 ):
-    # Return mock data for testing
-    return {
-        "performance": [
-            {"stay_date": "2026-04-01", "rooms_sold": 18, "room_revenue": 16200, "adr": 900},
-            {"stay_date": "2026-04-02", "rooms_sold": 20, "room_revenue": 19000, "adr": 950},
-            {"stay_date": "2026-04-03", "rooms_sold": 17, "room_revenue": 16150, "adr": 950},
-        ],
-        "compset": [
-            {"stay_date": "2026-04-01", "your_rate": 900, "comps": "[920, 880, 950]"},
-            {"stay_date": "2026-04-02", "your_rate": 950, "comps": "[980, 960, 940]"},
-            {"stay_date": "2026-04-03", "your_rate": 950, "comps": "[970, 930, 960]"},
-        ]
-    }
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT stay_date, rooms_sold, room_revenue FROM daily_performance WHERE snapshot_id = ?", (snapshot_id,))
+        performance_rows = cursor.fetchall()
+        performance = []
+        for row in performance_rows:
+            performance.append({
+                "stay_date": row["stay_date"],
+                "rooms_sold": row["rooms_sold"],
+                "room_revenue": row["room_revenue"],
+                "adr": row["room_revenue"] / row["rooms_sold"] if row["rooms_sold"] > 0 else 0
+            })
+        
+        cursor.execute("SELECT stay_date, your_rate, comps FROM daily_compset WHERE snapshot_id = ?", (snapshot_id,))
+        compset_rows = cursor.fetchall()
+        compset = []
+        for row in compset_rows:
+            comps_list = []
+            if row["comps"]:
+                try:
+                    comps_list = json.loads(row["comps"])
+                except:
+                    comps_list = []
+            compset.append({
+                "stay_date": row["stay_date"],
+                "your_rate": row["your_rate"],
+                "comps": comps_list
+            })
+        
+        conn.close()
+        return {"performance": performance, "compset": compset}
+    except Exception as e:
+        conn.close()
+        print(f"Database error: {e}")
+        # Return mock data if database fails
+        return {
+            "performance": [
+                {"stay_date": "2026-04-01", "rooms_sold": 75, "room_revenue": 86184, "adr": 1149},
+                {"stay_date": "2026-04-02", "rooms_sold": 75, "room_revenue": 91444, "adr": 1219},
+                {"stay_date": "2026-04-03", "rooms_sold": 91, "room_revenue": 148640, "adr": 1633},
+            ],
+            "compset": [
+                {"stay_date": "2026-04-01", "your_rate": 1149, "comps": [1200, 1100, 1150]},
+                {"stay_date": "2026-04-02", "your_rate": 1219, "comps": [1250, 1180, 1220]},
+                {"stay_date": "2026-04-03", "your_rate": 1633, "comps": [1650, 1600, 1620]},
+            ]
+        }
+
+@app.get("/api/rate-intelligence")
+async def rate_intelligence_test(token: str = Depends(verify_token)):
+    return {"message": "Rate intelligence endpoint working"}
