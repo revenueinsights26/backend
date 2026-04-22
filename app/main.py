@@ -1,204 +1,556 @@
-from fastapi import FastAPI, HTTPException, Depends, Security, Header
-from fastapi.security import APIKeyHeader
+from fastapi import FastAPI, Body, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
-import os
+from typing import List, Optional, Any
 import sqlite3
+from pathlib import Path
+import uuid
+import secrets
 import json
 from datetime import datetime
+import pandas as pd
+import os
 
-app = FastAPI()
+# Optional AI (kept safe; if key missing, commentary becomes None)
+try:
+    from openai import OpenAI
+    _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+except Exception:
+    _openai_client = None
 
-# CORS - Allow your frontend
+
+# -------------------------------------------------
+# App setup
+# -------------------------------------------------
+
+app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://revenueinsights26.github.io", "http://localhost:5500", "http://127.0.0.1:5500"],
+    allow_origins=["*"],   # local dev
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_credentials=True,
 )
 
-# API Key header
-API_KEY_NAME = "X-Owner-Token"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "db" / "revenue_insights.db"
+SCHEMA_PATH = BASE_DIR / "db" / "schema.sql"
 
-# Valid tokens (add your tokens here)
-VALID_TOKENS = {
-    "9MfYQDx1lVGWFFiQ_D9ibK7lMnruUU6-1jDqapC2if4": {"owner_id": "OWNER001", "is_active": True}
-}
 
-async def get_current_owner(api_key: str = Security(api_key_header)):
-    if api_key not in VALID_TOKENS:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    if not VALID_TOKENS[api_key]["is_active"]:
-        raise HTTPException(status_code=403, detail="Token is inactive")
-    return VALID_TOKENS[api_key]
+def get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# ─────────────────────────────────────────────
-# Database path
-# ─────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(__file__), "db", "revenue_insights.db")
 
-def get_db():
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
-    return None
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = get_conn()
+    cur = conn.cursor()
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        cur.executescript(f.read())
+    conn.commit()
+    conn.close()
 
-# ─────────────────────────────────────────────
-# Test endpoint
-# ─────────────────────────────────────────────
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+# -------------------------------------------------
+# Request models
+# -------------------------------------------------
+
+class PerfRow(BaseModel):
+    date: str               # YYYY-MM-DD
+    rooms_sold: int
+    room_revenue: float
+
+class CompRow(BaseModel):
+    date: str               # YYYY-MM-DD
+    your_rate: Optional[float] = None
+    comps: List[Optional[float]] = []
+
+class CalculateRequest(BaseModel):
+    hotel_id: str
+    period_start: str
+    period_end: str
+    rooms_available: int
+    performance_data: List[PerfRow]
+    compset_data: List[CompRow] = []
+    period_type: str = "monthly"
+
+
+# -------------------------------------------------
+# Auth helpers
+# -------------------------------------------------
+
+def get_owner_by_token(token: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT owner_id, service_tier, is_active FROM owners WHERE access_token = ?",
+        (token,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid owner token")
+
+    if row["is_active"] == 0:
+        raise HTTPException(status_code=403, detail="Subscription inactive")
+
+    return row
+
+
+def verify_hotel_ownership(owner_id: str, hotel_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM hotels WHERE hotel_id = ? AND owner_id = ?", (hotel_id, owner_id))
+    ok = cur.fetchone()
+    conn.close()
+    if not ok:
+        raise HTTPException(status_code=403, detail="Hotel does not belong to owner")
+
+
+# -------------------------------------------------
+# Utility helpers
+# -------------------------------------------------
+
+def safe_dict_row(row: sqlite3.Row) -> dict:
+    """Convert sqlite row to JSON-safe dict (fix bytes decoding)."""
+    out = {}
+    for k in row.keys():
+        v = row[k]
+        if isinstance(v, bytes):
+            out[k] = v.decode("utf-8", errors="ignore")
+        else:
+            out[k] = v
+    return out
+
+
+def compute_snapshot_kpis(perf_df: pd.DataFrame, rooms_available: int) -> dict:
+    # Expect columns: date, rooms_sold, room_revenue
+    days = perf_df["date"].nunique()
+    total_rooms_sold = perf_df["rooms_sold"].sum()
+    total_revenue = perf_df["room_revenue"].sum()
+
+    occ = (total_rooms_sold / (rooms_available * days)) * 100 if days > 0 else 0
+    adr = (total_revenue / total_rooms_sold) if total_rooms_sold > 0 else 0
+    revpar = (total_revenue / (rooms_available * days)) if days > 0 else 0
+
+    return {
+        "occupancy": float(round(occ, 2)),
+        "adr": float(round(adr, 2)),
+        "revpar": float(round(revpar, 2)),
+        "room_revenue": float(round(total_revenue, 2)),
+    }
+
+
+def simple_forecast(occupancy: float, adr: float) -> dict:
+    return {
+        "forecast_occupancy": float(round(occupancy, 1)),
+        "forecast_adr_min": float(round(adr * 0.97, 0)),
+        "forecast_adr_max": float(round(adr * 1.03, 0)),
+    }
+
+
+def generate_commentary(kpis: dict) -> Optional[str]:
+    if _openai_client is None:
+        return None
+
+    prompt = f"""
+You are a hotel revenue analyst.
+Explain the performance factually and concisely.
+
+Occupancy: {kpis['occupancy']}%
+ADR: {kpis['adr']}
+RevPAR: {kpis['revpar']}
+Room Revenue: {kpis['room_revenue']}
+
+Structure:
+1. Executive summary
+2. Change driver
+3. Forecast outlook
+"""
+    try:
+        resp = _openai_client.responses.create(
+            model="gpt-5",
+            input=prompt,
+            temperature=0.2,
+            max_output_tokens=250
+        )
+        return resp.output_text
+    except Exception:
+        return None
+
+
+# -------------------------------------------------
+# Core endpoints
+# -------------------------------------------------
+
 @app.get("/")
-async def root():
-    return {"message": "Backend is running", "status": "ok", "timestamp": datetime.now().isoformat()}
+def health():
+    return {"status": "OK"}
 
-# ─────────────────────────────────────────────
-# Hotel Dashboard History
-# ─────────────────────────────────────────────
-@app.get("/hotel_dashboard_history/{hotel_id}")
-async def get_hotel_dashboard_history(
+
+@app.post("/owners/create")
+def create_owner(
+    owner_id: str = Body(...),
+    owner_name: str = Body(...),
+    email: str = Body(...),
+    service_tier: str = Body(...),
+):
+    token = secrets.token_urlsafe(32)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO owners (owner_id, owner_name, email, service_tier, is_active, access_token)
+        VALUES (?, ?, ?, ?, 1, ?)
+        """,
+        (owner_id, owner_name, email, service_tier, token),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Owner created", "owner_token": token}
+
+
+@app.post("/hotels/create")
+def create_hotel(
+    hotel_id: str = Body(...),
+    owner_id: str = Body(...),
+    hotel_name: str = Body(...),
+    rooms_available: int = Body(...),
+    currency_code: str = Body(...),
+    currency_symbol: str = Body(...),
+):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO hotels (hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol),
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Hotel created"}
+
+
+@app.post("/calculate_and_store")
+def calculate_and_store(
+    payload: CalculateRequest,
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
+):
+    owner = get_owner_by_token(x_owner_token)
+    verify_hotel_ownership(owner["owner_id"], payload.hotel_id)
+
+    perf_df = pd.DataFrame([r.model_dump() for r in payload.performance_data])
+    # Normalize columns for safety
+    perf_df["rooms_sold"] = perf_df["rooms_sold"].fillna(0).astype(int)
+    perf_df["room_revenue"] = perf_df["room_revenue"].fillna(0).astype(float)
+
+    kpis = compute_snapshot_kpis(perf_df, payload.rooms_available)
+    fc = simple_forecast(kpis["occupancy"], kpis["adr"])
+    commentary = generate_commentary(kpis)
+
+    snapshot_id = str(uuid.uuid4())
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Store snapshot aggregates
+    cur.execute(
+        """
+        INSERT INTO snapshots (
+          snapshot_id, hotel_id, period_start, period_end,
+          occupancy, adr, revpar, room_revenue,
+          forecast_occupancy, forecast_adr_min, forecast_adr_max,
+          commentary
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot_id,
+            payload.hotel_id,
+            payload.period_start,
+            payload.period_end,
+            kpis["occupancy"],
+            kpis["adr"],
+            kpis["revpar"],
+            kpis["room_revenue"],
+            fc["forecast_occupancy"],
+            fc["forecast_adr_min"],
+            fc["forecast_adr_max"],
+            commentary,
+        ),
+    )
+
+    # Store daily performance rows
+    for _, r in perf_df.iterrows():
+        rooms_sold = int(r["rooms_sold"])
+        rev = float(r["room_revenue"])
+        adr = rev / rooms_sold if rooms_sold > 0 else 0.0
+
+        cur.execute(
+            """
+            INSERT INTO daily_performance (snapshot_id, hotel_id, stay_date, rooms_sold, room_revenue, adr)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (snapshot_id, payload.hotel_id, r["date"], rooms_sold, rev, float(round(adr, 2))),
+        )
+
+    # Store daily compset rows (optional, but supported)
+    for c in payload.compset_data:
+        cur.execute(
+            """
+            INSERT INTO daily_compset (snapshot_id, hotel_id, stay_date, your_rate, comp_rates_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                payload.hotel_id,
+                c.date,
+                c.your_rate,
+                json.dumps(c.comps),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "stored", "snapshot_id": snapshot_id}
+
+
+@app.get("/hotel_dashboard/{hotel_id}")
+def hotel_dashboard(
     hotel_id: str,
-    owner = Depends(get_current_owner)
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
 ):
-    # Return mock data since database might be corrupted
-    # This will get your frontend working immediately
-    return [
-        {
-            "snapshot_id": 1,
-            "hotel_id": hotel_id,
-            "period_start": "2026-04-01",
-            "period_end": "2026-04-30",
-            "created_at": "2026-04-01T00:00:00",
-            "forecast_occupancy": 72,
-            "forecast_adr_min": 1200,
-            "forecast_adr_max": 1400,
-            "commentary": "Based on historical data, occupancy is expected to remain strong."
-        },
-        {
-            "snapshot_id": 2,
-            "hotel_id": hotel_id,
-            "period_start": "2026-03-01",
-            "period_end": "2026-03-31",
-            "created_at": "2026-03-01T00:00:00",
-            "forecast_occupancy": 68,
-            "forecast_adr_min": 1150,
-            "forecast_adr_max": 1350,
-            "commentary": "Seasonal patterns suggest slight softening."
-        }
-    ]
+    owner = get_owner_by_token(x_owner_token)
+    verify_hotel_ownership(owner["owner_id"], hotel_id)
 
-# ─────────────────────────────────────────────
-# Daily by Snapshot
-# ─────────────────────────────────────────────
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM snapshots
+        WHERE hotel_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (hotel_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return {"message": "No data loaded"}
+    return safe_dict_row(row)
+
+
+@app.get("/hotel_dashboard_history/{hotel_id}")
+def hotel_dashboard_history(
+    hotel_id: str,
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
+):
+    owner = get_owner_by_token(x_owner_token)
+    verify_hotel_ownership(owner["owner_id"], hotel_id)
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM snapshots
+        WHERE hotel_id = ?
+        ORDER BY created_at ASC
+        """,
+        (hotel_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [safe_dict_row(r) for r in rows]
+
+
 @app.get("/daily_by_snapshot/{snapshot_id}")
-async def get_daily_by_snapshot(
-    snapshot_id: int,
-    owner = Depends(get_current_owner)
+def daily_by_snapshot(
+    snapshot_id: str,
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
 ):
-    # Return mock data for April 2026
-    if snapshot_id == 1:
-        performance = [
-            {"stay_date": "2026-04-01", "rooms_sold": 75, "room_revenue": 86184, "adr": 1149},
-            {"stay_date": "2026-04-02", "rooms_sold": 75, "room_revenue": 91444, "adr": 1219},
-            {"stay_date": "2026-04-03", "rooms_sold": 91, "room_revenue": 148640, "adr": 1633},
-            {"stay_date": "2026-04-04", "rooms_sold": 94, "room_revenue": 160350, "adr": 1706},
-            {"stay_date": "2026-04-05", "rooms_sold": 83, "room_revenue": 119362, "adr": 1438},
-            {"stay_date": "2026-04-06", "rooms_sold": 60, "room_revenue": 79417, "adr": 1324},
-            {"stay_date": "2026-04-07", "rooms_sold": 71, "room_revenue": 77819, "adr": 1096},
-            {"stay_date": "2026-04-08", "rooms_sold": 74, "room_revenue": 76343, "adr": 1032},
-            {"stay_date": "2026-04-09", "rooms_sold": 66, "room_revenue": 67473, "adr": 1022},
-            {"stay_date": "2026-04-10", "rooms_sold": 84, "room_revenue": 110402, "adr": 1195},
-            {"stay_date": "2026-04-11", "rooms_sold": 91, "room_revenue": 116961, "adr": 1285},
-            {"stay_date": "2026-04-12", "rooms_sold": 58, "room_revenue": 64047, "adr": 1104},
-            {"stay_date": "2026-04-13", "rooms_sold": 56, "room_revenue": 72679, "adr": 1009},
-            {"stay_date": "2026-04-14", "rooms_sold": 51, "room_revenue": 64116, "adr": 957},
-            {"stay_date": "2026-04-15", "rooms_sold": 44, "room_revenue": 59802, "adr": 934},
-        ]
-        compset = [
-            {"stay_date": "2026-04-01", "your_rate": 1149, "comps": [1200, 1100, 1150]},
-            {"stay_date": "2026-04-02", "your_rate": 1219, "comps": [1250, 1180, 1220]},
-            {"stay_date": "2026-04-03", "your_rate": 1633, "comps": [1650, 1600, 1620]},
-            {"stay_date": "2026-04-04", "your_rate": 1706, "comps": [1720, 1680, 1700]},
-            {"stay_date": "2026-04-05", "your_rate": 1438, "comps": [1450, 1400, 1420]},
-            {"stay_date": "2026-04-06", "your_rate": 1324, "comps": [1300, 1350, 1320]},
-            {"stay_date": "2026-04-07", "your_rate": 1096, "comps": [1100, 1080, 1090]},
-            {"stay_date": "2026-04-08", "your_rate": 1032, "comps": [1050, 1000, 1030]},
-            {"stay_date": "2026-04-09", "your_rate": 1022, "comps": [1020, 1000, 1010]},
-            {"stay_date": "2026-04-10", "your_rate": 1195, "comps": [1200, 1180, 1190]},
-            {"stay_date": "2026-04-11", "your_rate": 1285, "comps": [1300, 1270, 1280]},
-            {"stay_date": "2026-04-12", "your_rate": 1104, "comps": [1120, 1080, 1100]},
-            {"stay_date": "2026-04-13", "your_rate": 1009, "comps": [1020, 980, 1000]},
-            {"stay_date": "2026-04-14", "your_rate": 957, "comps": [960, 940, 950]},
-            {"stay_date": "2026-04-15", "your_rate": 934, "comps": [940, 920, 930]},
-        ]
-    else:
-        performance = []
-        compset = []
-    
-    return {"performance": performance, "compset": compset}
+    # Token validated; ownership enforced by joining hotel in snapshot
+    owner = get_owner_by_token(x_owner_token)
 
-# ─────────────────────────────────────────────
-# Rate Intelligence Endpoint
-# ─────────────────────────────────────────────
-class RateIntelligenceRequest(BaseModel):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # Determine hotel_id for this snapshot
+    cur.execute("SELECT hotel_id FROM snapshots WHERE snapshot_id = ?", (snapshot_id,))
+    snap = cur.fetchone()
+    if not snap:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    hotel_id = snap["hotel_id"]
+    verify_hotel_ownership(owner["owner_id"], hotel_id)
+
+    # Performance daily rows
+    cur.execute(
+        """
+        SELECT stay_date, rooms_sold, room_revenue, adr
+        FROM daily_performance
+        WHERE snapshot_id = ?
+        ORDER BY stay_date ASC
+        """,
+        (snapshot_id,),
+    )
+    perf_rows = [dict(r) for r in cur.fetchall()]
+
+    # Compset daily rows
+    cur.execute(
+        """
+        SELECT stay_date, your_rate, comp_rates_json
+        FROM daily_compset
+        WHERE snapshot_id = ?
+        ORDER BY stay_date ASC
+        """,
+        (snapshot_id,),
+    )
+    comp_rows = []
+    for r in cur.fetchall():
+        comp_rows.append({
+            "stay_date": r["stay_date"],
+            "your_rate": r["your_rate"],
+            "comps": json.loads(r["comp_rates_json"]) if r["comp_rates_json"] else []
+        })
+
+    conn.close()
+
+    return {"hotel_id": hotel_id, "snapshot_id": snapshot_id, "performance": perf_rows, "compset": comp_rows}
+
+
+# ─────────────────────────────────────────────────────────────
+# NEW: Protected Rate Intelligence Endpoint
+# ─────────────────────────────────────────────────────────────
+
+class RateIntelRequest(BaseModel):
     current_rate: float
     competitor_rates: List[float] = []
     historical_occupancy: float
     dow_factor: float = 50
     overall_avg_occ: float = 50
-    has_competitor_data: bool = False
 
-class RateIntelligenceResponse(BaseModel):
+class RateIntelResponse(BaseModel):
     suggested_rate: float
     confidence_score: int
     recommendation: str
     confidence_level: str
 
 @app.post("/api/rate-intelligence")
-async def get_rate_intelligence(
-    request: RateIntelligenceRequest,
-    owner = Depends(get_current_owner)
+def rate_intelligence(
+    req: RateIntelRequest,
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
 ):
-    suggested_rate = request.current_rate
+    # Verify token using your existing function
+    owner = get_owner_by_token(x_owner_token)
     
-    if request.historical_occupancy > 75:
-        suggested_rate = suggested_rate * 1.08
-        recommendation = "High demand - increase rate"
-    elif request.historical_occupancy > 60:
-        suggested_rate = suggested_rate * 1.03
-        recommendation = "Good demand - slight increase"
-    elif request.historical_occupancy < 50:
-        suggested_rate = suggested_rate * 0.95
-        recommendation = "Soft demand - slight decrease"
+    # Start with current rate
+    suggested = req.current_rate
+    
+    # ─────────────────────────────────────────────
+    # DEMAND ADJUSTMENT (PROTECTED LOGIC)
+    # Based on historical occupancy
+    # ─────────────────────────────────────────────
+    occ = req.historical_occupancy
+    if occ >= 80:
+        demand_multiplier = 1.08
+        demand_text = "high demand"
+    elif occ >= 65:
+        demand_multiplier = 1.03
+        demand_text = "good demand"
+    elif occ >= 50:
+        demand_multiplier = 1.00
+        demand_text = "moderate demand"
+    elif occ >= 35:
+        demand_multiplier = 0.97
+        demand_text = "soft demand"
     else:
-        recommendation = "Moderate demand - maintain rate"
+        demand_multiplier = 0.94
+        demand_text = "low demand"
     
-    if request.competitor_rates and len(request.competitor_rates) > 0:
-        comp_avg = sum(request.competitor_rates) / len(request.competitor_rates)
-        if comp_avg > request.current_rate * 1.1:
-            suggested_rate = max(suggested_rate, request.current_rate * 1.05)
-            recommendation = "Below competitors - increase rate"
-        elif comp_avg < request.current_rate * 0.9:
-            suggested_rate = min(suggested_rate, request.current_rate * 0.97)
-            recommendation = "Above competitors - slight decrease"
+    suggested = suggested * demand_multiplier
     
-    suggested_rate = round(suggested_rate / 10) * 10
+    # ─────────────────────────────────────────────
+    # COMPETITOR ADJUSTMENT (PROTECTED LOGIC)
+    # Based on competitor rate positioning
+    # ─────────────────────────────────────────────
+    comp_adjustment = 1.0
+    comp_text = ""
+    if req.competitor_rates and len(req.competitor_rates) > 0:
+        comp_avg = sum(req.competitor_rates) / len(req.competitor_rates)
+        if comp_avg > req.current_rate * 1.05:
+            comp_adjustment = 1.03
+            comp_text = "below competitors"
+        elif comp_avg < req.current_rate * 0.95:
+            comp_adjustment = 0.97
+            comp_text = "above competitors"
+        else:
+            comp_adjustment = 1.00
+            comp_text = "aligned with competitors"
     
-    confidence_score = 70
-    confidence_level = "Medium"
+    suggested = suggested * comp_adjustment
     
-    if request.competitor_rates and len(request.competitor_rates) >= 3:
-        confidence_score = 85
-        confidence_level = "High"
-    elif not request.competitor_rates or len(request.competitor_rates) == 0:
-        confidence_score = 50
-        confidence_level = "Low"
+    # ─────────────────────────────────────────────
+    # DAY-OF-WEEK ADJUSTMENT (PROTECTED LOGIC)
+    # Based on historical DOW patterns
+    # ─────────────────────────────────────────────
+    dow_adj = req.dow_factor / 50 if req.dow_factor > 0 else 1.0
+    dow_adj = max(0.95, min(1.05, dow_adj))
+    suggested = suggested * dow_adj
     
-    return RateIntelligenceResponse(
-        suggested_rate=suggested_rate,
-        confidence_score=confidence_score,
+    # Round to nearest 10
+    suggested = round(suggested / 10) * 10
+    
+    # ─────────────────────────────────────────────
+    # CONFIDENCE SCORE (PROTECTED LOGIC)
+    # Based on data quality and quantity
+    # ─────────────────────────────────────────────
+    comp_count = len(req.competitor_rates)
+    if comp_count >= 5:
+        confidence = 85
+        level = "High"
+    elif comp_count >= 3:
+        confidence = 75
+        level = "Medium"
+    elif comp_count >= 1:
+        confidence = 65
+        level = "Medium"
+    else:
+        confidence = 50
+        level = "Low"
+    
+    # ─────────────────────────────────────────────
+    # RECOMMENDATION TEXT (PROTECTED LOGIC)
+    # ─────────────────────────────────────────────
+    pct_change = ((suggested - req.current_rate) / req.current_rate) * 100
+    
+    if pct_change > 5:
+        recommendation = f"Increase rate by {round(pct_change)}% - {demand_text}, {comp_text}"
+    elif pct_change < -5:
+        recommendation = f"Decrease rate by {abs(round(pct_change))}% - {demand_text}, {comp_text}"
+    elif pct_change > 2:
+        recommendation = f"Slight increase ({round(pct_change)}%) - {demand_text}"
+    elif pct_change < -2:
+        recommendation = f"Slight decrease - {comp_text}"
+    else:
+        recommendation = f"Maintain current rate - {demand_text}, {comp_text}"
+    
+    return RateIntelResponse(
+        suggested_rate=suggested,
+        confidence_score=confidence,
         recommendation=recommendation,
-        confidence_level=confidence_level
+        confidence_level=level
     )
