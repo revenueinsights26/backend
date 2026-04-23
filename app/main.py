@@ -7,7 +7,8 @@ from pathlib import Path
 import uuid
 import secrets
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+import calendar
 import pandas as pd
 import os
 
@@ -31,7 +32,7 @@ else:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # local dev
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -88,7 +89,7 @@ class CalculateRequest(BaseModel):
 
 
 # -------------------------------------------------
-# NEW: Rate Intelligence Request/Response Models
+# Rate Intelligence Models
 # -------------------------------------------------
 
 class RateIntelRequest(BaseModel):
@@ -128,6 +129,15 @@ def get_owner_by_token(token: str):
     return row
 
 
+def get_hotel_rooms_available(hotel_id: str) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT rooms_available FROM hotels WHERE hotel_id = ?", (hotel_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["rooms_available"] if row else 100
+
+
 def verify_hotel_ownership(owner_id: str, hotel_id: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -155,7 +165,6 @@ def safe_dict_row(row: sqlite3.Row) -> dict:
 
 
 def compute_snapshot_kpis(perf_df: pd.DataFrame, rooms_available: int) -> dict:
-    # Expect columns: date, rooms_sold, room_revenue
     days = perf_df["date"].nunique()
     total_rooms_sold = perf_df["rooms_sold"].sum()
     total_revenue = perf_df["room_revenue"].sum()
@@ -211,7 +220,154 @@ Structure:
 
 
 # -------------------------------------------------
-# NEW: Protected Rate Intelligence Endpoint
+# NEW: PROTECTED ROLLING FORECAST ENDPOINT
+# -------------------------------------------------
+
+@app.get("/api/rolling-forecast/{hotel_id}")
+def rolling_forecast(
+    hotel_id: str,
+    x_owner_token: str = Header(..., alias="X-Owner-Token")
+):
+    """Protected endpoint that calculates rolling forecast based on actual data to date"""
+    owner = get_owner_by_token(x_owner_token)
+    verify_hotel_ownership(owner["owner_id"], hotel_id)
+    
+    # Get rooms available for this hotel
+    rooms_available = get_hotel_rooms_available(hotel_id)
+    
+    # Get latest snapshot
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT snapshot_id FROM snapshots 
+        WHERE hotel_id = ? 
+        ORDER BY created_at DESC LIMIT 1
+    """, (hotel_id,))
+    snap = cur.fetchone()
+    
+    if not snap:
+        conn.close()
+        return {
+            "error": "No data found",
+            "actual_revenue_to_date": 0,
+            "forecast_revenue": 0,
+            "days_remaining": 0
+        }
+    
+    # Get daily performance for this snapshot
+    cur.execute("""
+        SELECT stay_date, rooms_sold, room_revenue 
+        FROM daily_performance 
+        WHERE snapshot_id = ?
+        ORDER BY stay_date ASC
+    """, (snap["snapshot_id"],))
+    daily_data = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    
+    if not daily_data:
+        return {
+            "error": "No daily data found",
+            "actual_revenue_to_date": 0,
+            "forecast_revenue": 0,
+            "days_remaining": 0
+        }
+    
+    # Get today's date
+    today = datetime.now()
+    current_year = today.year
+    current_month = today.month
+    current_day = today.day
+    
+    # Days in current month
+    days_in_month = calendar.monthrange(current_year, current_month)[1]
+    
+    # Parse dates from daily data
+    parsed_data = []
+    for d in daily_data:
+        try:
+            date_obj = datetime.strptime(d["stay_date"], "%Y-%m-%d")
+            parsed_data.append({
+                "date": date_obj,
+                "day": date_obj.day,
+                "rooms_sold": d["rooms_sold"],
+                "room_revenue": d["room_revenue"]
+            })
+        except:
+            pass
+    
+    if not parsed_data:
+        return {
+            "error": "Invalid date format",
+            "actual_revenue_to_date": 0,
+            "forecast_revenue": 0,
+            "days_remaining": 0
+        }
+    
+    # Actual revenue so far (dates <= today)
+    actual_revenue = sum(d["room_revenue"] for d in parsed_data if d["day"] <= current_day)
+    actual_rooms_sold = sum(d["rooms_sold"] for d in parsed_data if d["day"] <= current_day)
+    
+    # Calculate actual occupancy to date
+    days_elapsed = current_day
+    actual_occ_pct = (actual_rooms_sold / (rooms_available * days_elapsed)) * 100 if days_elapsed > 0 else 0
+    
+    # Expected daily revenue (average of last 7 days or all available days)
+    last_7_days = [d for d in parsed_data if d["day"] > current_day - 7 and d["day"] <= current_day]
+    
+    if last_7_days:
+        avg_daily_revenue = sum(d["room_revenue"] for d in last_7_days) / len(last_7_days)
+        avg_daily_rooms = sum(d["rooms_sold"] for d in last_7_days) / len(last_7_days)
+    elif parsed_data:
+        avg_daily_revenue = sum(d["room_revenue"] for d in parsed_data) / len(parsed_data)
+        avg_daily_rooms = sum(d["rooms_sold"] for d in parsed_data) / len(parsed_data)
+    else:
+        avg_daily_revenue = 0
+        avg_daily_rooms = 0
+    
+    # Days remaining
+    days_remaining = max(0, days_in_month - current_day)
+    
+    # Forecast revenue
+    forecast_remaining_revenue = days_remaining * avg_daily_revenue
+    forecast_total_revenue = actual_revenue + forecast_remaining_revenue
+    
+    # Forecast occupancy
+    forecast_remaining_rooms = days_remaining * avg_daily_rooms
+    forecast_total_rooms = actual_rooms_sold + forecast_remaining_rooms
+    forecast_occ_pct = (forecast_total_rooms / (rooms_available * days_in_month)) * 100
+    
+    # ADR forecast (based on historical)
+    actual_adr = actual_revenue / actual_rooms_sold if actual_rooms_sold > 0 else 0
+    forecast_adr = actual_adr if actual_adr > 0 else avg_daily_revenue / avg_daily_rooms if avg_daily_rooms > 0 else 0
+    
+    # RevPAR forecast
+    forecast_revpar = (forecast_occ_pct / 100) * forecast_adr
+    
+    # Confidence score (higher as month progresses)
+    confidence = min(95, 50 + int((days_elapsed / days_in_month) * 45))
+    
+    return {
+        "actual_revenue_to_date": round(actual_revenue, 2),
+        "actual_occupancy_to_date": round(actual_occ_pct, 1),
+        "days_elapsed": days_elapsed,
+        "days_remaining": days_remaining,
+        "days_in_month": days_in_month,
+        "avg_daily_revenue": round(avg_daily_revenue, 2),
+        "forecast_remaining_revenue": round(forecast_remaining_revenue, 2),
+        "forecast_total_revenue": round(forecast_total_revenue, 2),
+        "forecast_total_revenue_min": round(forecast_total_revenue * 0.95, 2),
+        "forecast_total_revenue_max": round(forecast_total_revenue * 1.05, 2),
+        "forecast_occupancy": round(forecast_occ_pct, 1),
+        "forecast_adr": round(forecast_adr, 2),
+        "forecast_revpar": round(forecast_revpar, 2),
+        "confidence": confidence,
+        "is_rolling": True,
+        "note": f"Based on {days_elapsed} days actual + {days_remaining} days projected"
+    }
+
+
+# -------------------------------------------------
+# PROTECTED RATE INTELLIGENCE ENDPOINT
 # -------------------------------------------------
 
 @app.post("/api/rate-intelligence")
@@ -225,9 +381,7 @@ def rate_intelligence(
     # Start with current rate
     suggested = req.current_rate
     
-    # ─────────────────────────────────────────────
     # DEMAND ADJUSTMENT (HIDDEN)
-    # ─────────────────────────────────────────────
     occ = req.historical_occupancy
     if occ >= 80:
         demand = 1.08
@@ -247,9 +401,7 @@ def rate_intelligence(
     
     suggested = suggested * demand
     
-    # ─────────────────────────────────────────────
     # COMPETITOR ADJUSTMENT (HIDDEN)
-    # ─────────────────────────────────────────────
     comp_text = ""
     if req.competitor_rates and len(req.competitor_rates) > 0:
         comp_avg = sum(req.competitor_rates) / len(req.competitor_rates)
@@ -262,9 +414,7 @@ def rate_intelligence(
         else:
             comp_text = "aligned with competitors"
     
-    # ─────────────────────────────────────────────
     # DOW ADJUSTMENT (HIDDEN)
-    # ─────────────────────────────────────────────
     dow_adj = req.dow_factor / 50 if req.dow_factor > 0 else 1.0
     dow_adj = max(0.95, min(1.05, dow_adj))
     suggested = suggested * dow_adj
@@ -272,9 +422,7 @@ def rate_intelligence(
     # Round to nearest 10
     suggested = round(suggested / 10) * 10
     
-    # ─────────────────────────────────────────────
     # CONFIDENCE SCORE (HIDDEN)
-    # ─────────────────────────────────────────────
     comp_count = len(req.competitor_rates)
     if comp_count >= 5:
         confidence = 85
@@ -289,9 +437,7 @@ def rate_intelligence(
         confidence = 50
         level = "Low"
     
-    # ─────────────────────────────────────────────
     # RECOMMENDATION TEXT (HIDDEN)
-    # ─────────────────────────────────────────────
     pct = ((suggested - req.current_rate) / req.current_rate) * 100
     
     if pct > 5:
@@ -376,7 +522,6 @@ def calculate_and_store(
     verify_hotel_ownership(owner["owner_id"], payload.hotel_id)
 
     perf_df = pd.DataFrame([r.model_dump() for r in payload.performance_data])
-    # Normalize columns for safety
     perf_df["rooms_sold"] = perf_df["rooms_sold"].fillna(0).astype(int)
     perf_df["room_revenue"] = perf_df["room_revenue"].fillna(0).astype(float)
 
@@ -389,7 +534,6 @@ def calculate_and_store(
     conn = get_conn()
     cur = conn.cursor()
 
-    # Store snapshot aggregates
     cur.execute(
         """
         INSERT INTO snapshots (
@@ -416,7 +560,6 @@ def calculate_and_store(
         ),
     )
 
-    # Store daily performance rows
     for _, r in perf_df.iterrows():
         rooms_sold = int(r["rooms_sold"])
         rev = float(r["room_revenue"])
@@ -430,7 +573,6 @@ def calculate_and_store(
             (snapshot_id, payload.hotel_id, r["date"], rooms_sold, rev, float(round(adr, 2))),
         )
 
-    # Store daily compset rows (optional, but supported)
     for c in payload.compset_data:
         cur.execute(
             """
@@ -506,13 +648,11 @@ def daily_by_snapshot(
     snapshot_id: str,
     x_owner_token: str = Header(..., alias="X-Owner-Token"),
 ):
-    # Token validated; ownership enforced by joining hotel in snapshot
     owner = get_owner_by_token(x_owner_token)
 
     conn = get_conn()
     cur = conn.cursor()
 
-    # Determine hotel_id for this snapshot
     cur.execute("SELECT hotel_id FROM snapshots WHERE snapshot_id = ?", (snapshot_id,))
     snap = cur.fetchone()
     if not snap:
@@ -522,7 +662,6 @@ def daily_by_snapshot(
     hotel_id = snap["hotel_id"]
     verify_hotel_ownership(owner["owner_id"], hotel_id)
 
-    # Performance daily rows
     cur.execute(
         """
         SELECT stay_date, rooms_sold, room_revenue, adr
@@ -534,7 +673,6 @@ def daily_by_snapshot(
     )
     perf_rows = [dict(r) for r in cur.fetchall()]
 
-    # Compset daily rows
     cur.execute(
         """
         SELECT stay_date, your_rate, comp_rates_json
