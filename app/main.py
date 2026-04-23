@@ -333,6 +333,9 @@ def rate_intelligence(
 def health():
     return {"status": "OK"}
 
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "revenue-insights"}
 
 @app.post("/owners/create")
 def create_owner(
