@@ -23,6 +23,7 @@ except Exception:
 # App setup
 # -------------------------------------------------
 
+# Disable docs in production
 if os.getenv("ENVIRONMENT") == "production":
     app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0", docs_url=None, redoc_url=None, openapi_url=None)
 else:
@@ -84,6 +85,24 @@ class CalculateRequest(BaseModel):
     performance_data: List[PerfRow]
     compset_data: List[CompRow] = []
     period_type: str = "monthly"
+
+
+# -------------------------------------------------
+# NEW: Rate Intelligence Request/Response Models
+# -------------------------------------------------
+
+class RateIntelRequest(BaseModel):
+    current_rate: float
+    competitor_rates: List[float] = []
+    historical_occupancy: float
+    dow_factor: float = 50
+    overall_avg_occ: float = 50
+
+class RateIntelResponse(BaseModel):
+    suggested_rate: float
+    confidence_score: int
+    recommendation: str
+    confidence_level: str
 
 
 # -------------------------------------------------
@@ -189,6 +208,109 @@ Structure:
         return resp.output_text
     except Exception:
         return None
+
+
+# -------------------------------------------------
+# NEW: Protected Rate Intelligence Endpoint
+# -------------------------------------------------
+
+@app.post("/api/rate-intelligence")
+def rate_intelligence(
+    req: RateIntelRequest,
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
+):
+    # Verify token
+    owner = get_owner_by_token(x_owner_token)
+    
+    # Start with current rate
+    suggested = req.current_rate
+    
+    # ─────────────────────────────────────────────
+    # DEMAND ADJUSTMENT (HIDDEN)
+    # ─────────────────────────────────────────────
+    occ = req.historical_occupancy
+    if occ >= 80:
+        demand = 1.08
+        demand_text = "high demand"
+    elif occ >= 65:
+        demand = 1.03
+        demand_text = "good demand"
+    elif occ >= 50:
+        demand = 1.00
+        demand_text = "moderate demand"
+    elif occ >= 35:
+        demand = 0.97
+        demand_text = "soft demand"
+    else:
+        demand = 0.94
+        demand_text = "low demand"
+    
+    suggested = suggested * demand
+    
+    # ─────────────────────────────────────────────
+    # COMPETITOR ADJUSTMENT (HIDDEN)
+    # ─────────────────────────────────────────────
+    comp_text = ""
+    if req.competitor_rates and len(req.competitor_rates) > 0:
+        comp_avg = sum(req.competitor_rates) / len(req.competitor_rates)
+        if comp_avg > req.current_rate * 1.05:
+            suggested = suggested * 1.03
+            comp_text = "below competitors"
+        elif comp_avg < req.current_rate * 0.95:
+            suggested = suggested * 0.97
+            comp_text = "above competitors"
+        else:
+            comp_text = "aligned with competitors"
+    
+    # ─────────────────────────────────────────────
+    # DOW ADJUSTMENT (HIDDEN)
+    # ─────────────────────────────────────────────
+    dow_adj = req.dow_factor / 50 if req.dow_factor > 0 else 1.0
+    dow_adj = max(0.95, min(1.05, dow_adj))
+    suggested = suggested * dow_adj
+    
+    # Round to nearest 10
+    suggested = round(suggested / 10) * 10
+    
+    # ─────────────────────────────────────────────
+    # CONFIDENCE SCORE (HIDDEN)
+    # ─────────────────────────────────────────────
+    comp_count = len(req.competitor_rates)
+    if comp_count >= 5:
+        confidence = 85
+        level = "High"
+    elif comp_count >= 3:
+        confidence = 75
+        level = "Medium"
+    elif comp_count >= 1:
+        confidence = 65
+        level = "Medium"
+    else:
+        confidence = 50
+        level = "Low"
+    
+    # ─────────────────────────────────────────────
+    # RECOMMENDATION TEXT (HIDDEN)
+    # ─────────────────────────────────────────────
+    pct = ((suggested - req.current_rate) / req.current_rate) * 100
+    
+    if pct > 5:
+        rec = f"Increase rate by {round(pct)}% - {demand_text}, {comp_text}"
+    elif pct < -5:
+        rec = f"Decrease rate by {abs(round(pct))}% - {demand_text}, {comp_text}"
+    elif pct > 2:
+        rec = f"Slight increase ({round(pct)}%) - {demand_text}"
+    elif pct < -2:
+        rec = f"Slight decrease - {comp_text}"
+    else:
+        rec = f"Maintain current rate - {demand_text}, {comp_text}"
+    
+    return RateIntelResponse(
+        suggested_rate=suggested,
+        confidence_score=confidence,
+        recommendation=rec,
+        confidence_level=level
+    )
 
 
 # -------------------------------------------------
