@@ -23,7 +23,10 @@ except Exception:
 # App setup
 # -------------------------------------------------
 
-app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
+if os.getenv("ENVIRONMENT") == "production":
+    app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0", docs_url=None, redoc_url=None, openapi_url=None)
+else:
+    app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
