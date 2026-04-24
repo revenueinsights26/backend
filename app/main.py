@@ -313,7 +313,7 @@ def rate_intelligence(
 
 
 # -------------------------------------------------
-# ADMIN: View All Clients (Owners + Hotels) - FIXED
+# ADMIN: View All Clients (Owners + Hotels) - FIXED (no created_at)
 # -------------------------------------------------
 
 @app.get("/admin/clients")
@@ -339,21 +339,11 @@ async def admin_clients():
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         
-        # Check if tables exist
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='owners'")
-        if not cur.fetchone():
-            conn.close()
-            return {
-                "success": False,
-                "error": "No tables found",
-                "message": "Database exists but no owners table. Please create owners first."
-            }
-        
-        # Get all owners
+        # Get all owners (without created_at)
         cur.execute("""
-            SELECT owner_id, owner_name, email, service_tier, is_active, access_token, created_at 
+            SELECT owner_id, owner_name, email, service_tier, is_active, access_token 
             FROM owners 
-            ORDER BY created_at DESC
+            ORDER BY owner_id
         """)
         owners = []
         for row in cur.fetchall():
@@ -363,15 +353,14 @@ async def admin_clients():
                 "email": row["email"],
                 "service_tier": row["service_tier"],
                 "is_active": row["is_active"],
-                "access_token": row["access_token"],
-                "created_at": row["created_at"]
+                "access_token": row["access_token"]
             })
         
-        # Get all hotels
+        # Get all hotels (without created_at)
         cur.execute("""
-            SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol, created_at 
+            SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol 
             FROM hotels 
-            ORDER BY created_at DESC
+            ORDER BY hotel_id
         """)
         hotels = []
         for row in cur.fetchall():
@@ -381,8 +370,7 @@ async def admin_clients():
                 "hotel_name": row["hotel_name"],
                 "rooms_available": row["rooms_available"],
                 "currency_code": row["currency_code"],
-                "currency_symbol": row["currency_symbol"],
-                "created_at": row["created_at"]
+                "currency_symbol": row["currency_symbol"]
             })
         
         conn.close()
