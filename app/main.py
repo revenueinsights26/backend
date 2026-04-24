@@ -313,16 +313,42 @@ def rate_intelligence(
 
 
 # -------------------------------------------------
-# ROLLING FORECAST ENDPOINT (COMING SOON - DISABLED)
+# ADMIN: View All Clients (Owners + Hotels)
 # -------------------------------------------------
 
-# @app.get("/api/rolling-forecast/{hotel_id}")
-# def rolling_forecast(
-#     hotel_id: str,
-#     x_owner_token: str = Header(..., alias="X-Owner-Token")
-# ):
-#     # This endpoint is currently disabled
-#     return {"error": "Rolling forecast coming soon", "days_remaining": 0}
+@app.get("/admin/clients")
+async def admin_clients():
+    """
+    Returns all owners and hotels from the database.
+    No authentication required for now (add later if needed).
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    # Get all owners
+    cur.execute("""
+        SELECT owner_id, owner_name, email, service_tier, is_active, access_token, created_at 
+        FROM owners 
+        ORDER BY created_at DESC
+    """)
+    owners = [dict(row) for row in cur.fetchall()]
+    
+    # Get all hotels
+    cur.execute("""
+        SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol, created_at 
+        FROM hotels 
+        ORDER BY created_at DESC
+    """)
+    hotels = [dict(row) for row in cur.fetchall()]
+    
+    conn.close()
+    
+    return {
+        "total_owners": len(owners),
+        "total_hotels": len(hotels),
+        "owners": owners,
+        "hotels": hotels
+    }
 
 
 # -------------------------------------------------
@@ -333,9 +359,6 @@ def rate_intelligence(
 def health():
     return {"status": "OK"}
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "service": "revenue-insights"}
 
 @app.post("/owners/create")
 def create_owner(
