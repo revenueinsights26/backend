@@ -313,42 +313,95 @@ def rate_intelligence(
 
 
 # -------------------------------------------------
-# ADMIN: View All Clients (Owners + Hotels)
+# ADMIN: View All Clients (Owners + Hotels) - FIXED
 # -------------------------------------------------
 
 @app.get("/admin/clients")
 async def admin_clients():
     """
     Returns all owners and hotels from the database.
-    No authentication required for now (add later if needed).
     """
-    conn = get_conn()
-    cur = conn.cursor()
+    import traceback
     
-    # Get all owners
-    cur.execute("""
-        SELECT owner_id, owner_name, email, service_tier, is_active, access_token, created_at 
-        FROM owners 
-        ORDER BY created_at DESC
-    """)
-    owners = [dict(row) for row in cur.fetchall()]
-    
-    # Get all hotels
-    cur.execute("""
-        SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol, created_at 
-        FROM hotels 
-        ORDER BY created_at DESC
-    """)
-    hotels = [dict(row) for row in cur.fetchall()]
-    
-    conn.close()
-    
-    return {
-        "total_owners": len(owners),
-        "total_hotels": len(hotels),
-        "owners": owners,
-        "hotels": hotels
-    }
+    try:
+        # Direct database connection
+        DB_PATH = BASE_DIR / "db" / "revenue_insights.db"
+        
+        if not DB_PATH.exists():
+            return {
+                "success": False,
+                "error": "Database file not found",
+                "db_path": str(DB_PATH),
+                "message": "Please upload data first to create database"
+            }
+        
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        
+        # Check if tables exist
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='owners'")
+        if not cur.fetchone():
+            conn.close()
+            return {
+                "success": False,
+                "error": "No tables found",
+                "message": "Database exists but no owners table. Please create owners first."
+            }
+        
+        # Get all owners
+        cur.execute("""
+            SELECT owner_id, owner_name, email, service_tier, is_active, access_token, created_at 
+            FROM owners 
+            ORDER BY created_at DESC
+        """)
+        owners = []
+        for row in cur.fetchall():
+            owners.append({
+                "owner_id": row["owner_id"],
+                "owner_name": row["owner_name"],
+                "email": row["email"],
+                "service_tier": row["service_tier"],
+                "is_active": row["is_active"],
+                "access_token": row["access_token"],
+                "created_at": row["created_at"]
+            })
+        
+        # Get all hotels
+        cur.execute("""
+            SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol, created_at 
+            FROM hotels 
+            ORDER BY created_at DESC
+        """)
+        hotels = []
+        for row in cur.fetchall():
+            hotels.append({
+                "hotel_id": row["hotel_id"],
+                "owner_id": row["owner_id"],
+                "hotel_name": row["hotel_name"],
+                "rooms_available": row["rooms_available"],
+                "currency_code": row["currency_code"],
+                "currency_symbol": row["currency_symbol"],
+                "created_at": row["created_at"]
+            })
+        
+        conn.close()
+        
+        return {
+            "success": True,
+            "total_owners": len(owners),
+            "total_hotels": len(hotels),
+            "owners": owners,
+            "hotels": hotels
+        }
+        
+    except Exception as e:
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Database error occurred"
+        }
 
 
 # -------------------------------------------------
