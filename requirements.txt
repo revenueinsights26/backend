@@ -2,4 +2,7 @@ fastapi
 uvicorn
 pandas
 pydantic
-
+python-multipart
+sqlalchemy
+psycopg2-binary
+openai
