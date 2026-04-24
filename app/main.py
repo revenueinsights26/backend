@@ -2,15 +2,16 @@ from fastapi import FastAPI, Body, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Any
-import sqlite3
-from pathlib import Path
+import os
 import uuid
 import secrets
 import json
 from datetime import datetime, timedelta
 import calendar
 import pandas as pd
-import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 
 # Optional AI (kept safe; if key missing, commentary becomes None)
 try:
@@ -38,25 +39,99 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "db" / "revenue_insights.db"
-SCHEMA_PATH = BASE_DIR / "db" / "schema.sql"
+# Database connection
+DATABASE_URL = os.getenv("DATABASE_URL")
 
+# Create connection pool
+db_pool = SimpleConnectionPool(1, 10, DATABASE_URL)
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return db_pool.getconn()
 
+def put_conn(conn):
+    db_pool.putconn(conn)
 
 def init_db():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = get_conn()
     cur = conn.cursor()
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-        cur.executescript(f.read())
+    
+    # Create owners table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS owners (
+            owner_id TEXT PRIMARY KEY,
+            owner_name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            service_tier TEXT DEFAULT 'pro',
+            is_active INTEGER DEFAULT 1,
+            access_token TEXT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Create hotels table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS hotels (
+            hotel_id TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL,
+            hotel_name TEXT NOT NULL,
+            rooms_available INTEGER DEFAULT 10,
+            currency_code TEXT DEFAULT 'ZAR',
+            currency_symbol TEXT DEFAULT 'R',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (owner_id) REFERENCES owners(owner_id)
+        )
+    """)
+    
+    # Create snapshots table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            hotel_id TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            occupancy REAL,
+            adr REAL,
+            revpar REAL,
+            room_revenue REAL,
+            forecast_occupancy REAL,
+            forecast_adr_min REAL,
+            forecast_adr_max REAL,
+            commentary TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (hotel_id) REFERENCES hotels(hotel_id)
+        )
+    """)
+    
+    # Create daily_performance table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_performance (
+            id SERIAL PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            hotel_id TEXT NOT NULL,
+            stay_date TEXT NOT NULL,
+            rooms_sold INTEGER,
+            room_revenue REAL,
+            adr REAL,
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+        )
+    """)
+    
+    # Create daily_compset table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS daily_compset (
+            id SERIAL PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            hotel_id TEXT NOT NULL,
+            stay_date TEXT NOT NULL,
+            your_rate REAL,
+            comp_rates_json TEXT,
+            FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+        )
+    """)
+    
     conn.commit()
-    conn.close()
+    cur.close()
+    put_conn(conn)
 
 
 @app.on_event("startup")
@@ -69,12 +144,12 @@ def startup():
 # -------------------------------------------------
 
 class PerfRow(BaseModel):
-    date: str               # YYYY-MM-DD
+    date: str
     rooms_sold: int
     room_revenue: float
 
 class CompRow(BaseModel):
-    date: str               # YYYY-MM-DD
+    date: str
     your_rate: Optional[float] = None
     comps: List[Optional[float]] = []
 
@@ -112,13 +187,14 @@ class RateIntelResponse(BaseModel):
 
 def get_owner_by_token(token: str):
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
-        "SELECT owner_id, service_tier, is_active FROM owners WHERE access_token = ?",
+        "SELECT owner_id, service_tier, is_active FROM owners WHERE access_token = %s",
         (token,),
     )
     row = cur.fetchone()
-    conn.close()
+    cur.close()
+    put_conn(conn)
 
     if not row:
         raise HTTPException(status_code=401, detail="Invalid owner token")
@@ -131,19 +207,21 @@ def get_owner_by_token(token: str):
 
 def get_hotel_rooms_available(hotel_id: str) -> int:
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT rooms_available FROM hotels WHERE hotel_id = ?", (hotel_id,))
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT rooms_available FROM hotels WHERE hotel_id = %s", (hotel_id,))
     row = cur.fetchone()
-    conn.close()
+    cur.close()
+    put_conn(conn)
     return row["rooms_available"] if row else 100
 
 
 def verify_hotel_ownership(owner_id: str, hotel_id: str):
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM hotels WHERE hotel_id = ? AND owner_id = ?", (hotel_id, owner_id))
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT 1 FROM hotels WHERE hotel_id = %s AND owner_id = %s", (hotel_id, owner_id))
     ok = cur.fetchone()
-    conn.close()
+    cur.close()
+    put_conn(conn)
     if not ok:
         raise HTTPException(status_code=403, detail="Hotel does not belong to owner")
 
@@ -152,13 +230,14 @@ def verify_hotel_ownership(owner_id: str, hotel_id: str):
 # Utility helpers
 # -------------------------------------------------
 
-def safe_dict_row(row: sqlite3.Row) -> dict:
-    """Convert sqlite row to JSON-safe dict (fix bytes decoding)."""
+def safe_dict_row(row: dict) -> dict:
+    """Convert dict to JSON-safe dict."""
     out = {}
-    for k in row.keys():
-        v = row[k]
+    for k, v in row.items():
         if isinstance(v, bytes):
             out[k] = v.decode("utf-8", errors="ignore")
+        elif isinstance(v, datetime):
+            out[k] = v.isoformat()
         else:
             out[k] = v
     return out
@@ -228,13 +307,10 @@ def rate_intelligence(
     req: RateIntelRequest,
     x_owner_token: str = Header(..., alias="X-Owner-Token"),
 ):
-    # Verify token
     owner = get_owner_by_token(x_owner_token)
     
-    # Start with current rate
     suggested = req.current_rate
     
-    # DEMAND ADJUSTMENT (HIDDEN)
     occ = req.historical_occupancy
     if occ >= 80:
         demand = 1.08
@@ -254,7 +330,6 @@ def rate_intelligence(
     
     suggested = suggested * demand
     
-    # COMPETITOR ADJUSTMENT (HIDDEN)
     comp_text = ""
     if req.competitor_rates and len(req.competitor_rates) > 0:
         comp_avg = sum(req.competitor_rates) / len(req.competitor_rates)
@@ -267,15 +342,12 @@ def rate_intelligence(
         else:
             comp_text = "aligned with competitors"
     
-    # DOW ADJUSTMENT (HIDDEN)
     dow_adj = req.dow_factor / 50 if req.dow_factor > 0 else 1.0
     dow_adj = max(0.95, min(1.05, dow_adj))
     suggested = suggested * dow_adj
     
-    # Round to nearest 10
     suggested = round(suggested / 10) * 10
     
-    # CONFIDENCE SCORE (HIDDEN)
     comp_count = len(req.competitor_rates)
     if comp_count >= 5:
         confidence = 85
@@ -290,7 +362,6 @@ def rate_intelligence(
         confidence = 50
         level = "Low"
     
-    # RECOMMENDATION TEXT (HIDDEN)
     pct = ((suggested - req.current_rate) / req.current_rate) * 100
     
     if pct > 5:
@@ -313,83 +384,38 @@ def rate_intelligence(
 
 
 # -------------------------------------------------
-# ADMIN: View All Clients (Owners + Hotels) - FIXED (no created_at)
+# ADMIN: View All Clients
 # -------------------------------------------------
 
 @app.get("/admin/clients")
 async def admin_clients():
-    """
-    Returns all owners and hotels from the database.
-    """
-    import traceback
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    try:
-        # Direct database connection
-        DB_PATH = BASE_DIR / "db" / "revenue_insights.db"
-        
-        if not DB_PATH.exists():
-            return {
-                "success": False,
-                "error": "Database file not found",
-                "db_path": str(DB_PATH),
-                "message": "Please upload data first to create database"
-            }
-        
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        
-        # Get all owners (without created_at)
-        cur.execute("""
-            SELECT owner_id, owner_name, email, service_tier, is_active, access_token 
-            FROM owners 
-            ORDER BY owner_id
-        """)
-        owners = []
-        for row in cur.fetchall():
-            owners.append({
-                "owner_id": row["owner_id"],
-                "owner_name": row["owner_name"],
-                "email": row["email"],
-                "service_tier": row["service_tier"],
-                "is_active": row["is_active"],
-                "access_token": row["access_token"]
-            })
-        
-        # Get all hotels (without created_at)
-        cur.execute("""
-            SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol 
-            FROM hotels 
-            ORDER BY hotel_id
-        """)
-        hotels = []
-        for row in cur.fetchall():
-            hotels.append({
-                "hotel_id": row["hotel_id"],
-                "owner_id": row["owner_id"],
-                "hotel_name": row["hotel_name"],
-                "rooms_available": row["rooms_available"],
-                "currency_code": row["currency_code"],
-                "currency_symbol": row["currency_symbol"]
-            })
-        
-        conn.close()
-        
-        return {
-            "success": True,
-            "total_owners": len(owners),
-            "total_hotels": len(hotels),
-            "owners": owners,
-            "hotels": hotels
-        }
-        
-    except Exception as e:
-        traceback.print_exc()
-        return {
-            "success": False,
-            "error": str(e),
-            "message": "Database error occurred"
-        }
+    cur.execute("""
+        SELECT owner_id, owner_name, email, service_tier, is_active, access_token, created_at 
+        FROM owners 
+        ORDER BY created_at DESC
+    """)
+    owners = [dict(row) for row in cur.fetchall()]
+    
+    cur.execute("""
+        SELECT hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol, created_at 
+        FROM hotels 
+        ORDER BY created_at DESC
+    """)
+    hotels = [dict(row) for row in cur.fetchall()]
+    
+    cur.close()
+    put_conn(conn)
+    
+    return {
+        "success": True,
+        "total_owners": len(owners),
+        "total_hotels": len(hotels),
+        "owners": owners,
+        "hotels": hotels
+    }
 
 
 # -------------------------------------------------
@@ -414,12 +440,13 @@ def create_owner(
     cur.execute(
         """
         INSERT INTO owners (owner_id, owner_name, email, service_tier, is_active, access_token)
-        VALUES (?, ?, ?, ?, 1, ?)
+        VALUES (%s, %s, %s, %s, 1, %s)
         """,
         (owner_id, owner_name, email, service_tier, token),
     )
     conn.commit()
-    conn.close()
+    cur.close()
+    put_conn(conn)
     return {"message": "Owner created", "owner_token": token}
 
 
@@ -437,12 +464,13 @@ def create_hotel(
     cur.execute(
         """
         INSERT INTO hotels (hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
         """,
         (hotel_id, owner_id, hotel_name, rooms_available, currency_code, currency_symbol),
     )
     conn.commit()
-    conn.close()
+    cur.close()
+    put_conn(conn)
     return {"message": "Hotel created"}
 
 
@@ -475,7 +503,7 @@ def calculate_and_store(
           forecast_occupancy, forecast_adr_min, forecast_adr_max,
           commentary
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             snapshot_id,
@@ -501,7 +529,7 @@ def calculate_and_store(
         cur.execute(
             """
             INSERT INTO daily_performance (snapshot_id, hotel_id, stay_date, rooms_sold, room_revenue, adr)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
             """,
             (snapshot_id, payload.hotel_id, r["date"], rooms_sold, rev, float(round(adr, 2))),
         )
@@ -510,7 +538,7 @@ def calculate_and_store(
         cur.execute(
             """
             INSERT INTO daily_compset (snapshot_id, hotel_id, stay_date, your_rate, comp_rates_json)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
             """,
             (
                 snapshot_id,
@@ -522,7 +550,8 @@ def calculate_and_store(
         )
 
     conn.commit()
-    conn.close()
+    cur.close()
+    put_conn(conn)
 
     return {"status": "stored", "snapshot_id": snapshot_id}
 
@@ -536,18 +565,19 @@ def hotel_dashboard(
     verify_hotel_ownership(owner["owner_id"], hotel_id)
 
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
         """
         SELECT * FROM snapshots
-        WHERE hotel_id = ?
+        WHERE hotel_id = %s
         ORDER BY created_at DESC
         LIMIT 1
         """,
         (hotel_id,),
     )
     row = cur.fetchone()
-    conn.close()
+    cur.close()
+    put_conn(conn)
     if not row:
         return {"message": "No data loaded"}
     return safe_dict_row(row)
@@ -562,17 +592,18 @@ def hotel_dashboard_history(
     verify_hotel_ownership(owner["owner_id"], hotel_id)
 
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute(
         """
         SELECT * FROM snapshots
-        WHERE hotel_id = ?
+        WHERE hotel_id = %s
         ORDER BY created_at ASC
         """,
         (hotel_id,),
     )
     rows = cur.fetchall()
-    conn.close()
+    cur.close()
+    put_conn(conn)
     return [safe_dict_row(r) for r in rows]
 
 
@@ -584,12 +615,13 @@ def daily_by_snapshot(
     owner = get_owner_by_token(x_owner_token)
 
     conn = get_conn()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    cur.execute("SELECT hotel_id FROM snapshots WHERE snapshot_id = ?", (snapshot_id,))
+    cur.execute("SELECT hotel_id FROM snapshots WHERE snapshot_id = %s", (snapshot_id,))
     snap = cur.fetchone()
     if not snap:
-        conn.close()
+        cur.close()
+        put_conn(conn)
         raise HTTPException(status_code=404, detail="Snapshot not found")
 
     hotel_id = snap["hotel_id"]
@@ -599,18 +631,18 @@ def daily_by_snapshot(
         """
         SELECT stay_date, rooms_sold, room_revenue, adr
         FROM daily_performance
-        WHERE snapshot_id = ?
+        WHERE snapshot_id = %s
         ORDER BY stay_date ASC
         """,
         (snapshot_id,),
     )
-    perf_rows = [dict(r) for r in cur.fetchall()]
+    perf_rows = [dict(row) for row in cur.fetchall()]
 
     cur.execute(
         """
         SELECT stay_date, your_rate, comp_rates_json
         FROM daily_compset
-        WHERE snapshot_id = ?
+        WHERE snapshot_id = %s
         ORDER BY stay_date ASC
         """,
         (snapshot_id,),
@@ -623,6 +655,7 @@ def daily_by_snapshot(
             "comps": json.loads(r["comp_rates_json"]) if r["comp_rates_json"] else []
         })
 
-    conn.close()
+    cur.close()
+    put_conn(conn)
 
     return {"hotel_id": hotel_id, "snapshot_id": snapshot_id, "performance": perf_rows, "compset": comp_rows}
