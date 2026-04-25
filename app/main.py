@@ -260,35 +260,165 @@ def compute_snapshot_kpis(perf_df: pd.DataFrame, rooms_available: int) -> dict:
     }
 
 
-def simple_forecast(occupancy: float, adr: float) -> dict:
+# =========================================================
+# 4-BRANCH FORECAST - REPLACES simple_forecast
+# =========================================================
+
+def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int) -> dict:
+    """
+    4-branch forecast for any future month - works even with limited data
+    Branch 1: Seasonal (has same month last year)
+    Branch 2: Trend-based (90+ days of history)
+    Branch 3: Moving average (30-90 days)
+    Branch 4: Limited data fallback
+    """
+    
+    # Get historical snapshots for this hotel
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT * FROM snapshots 
+        WHERE hotel_id = %s 
+        ORDER BY created_at DESC
+    """, (hotel_id,))
+    snapshots = cur.fetchall()
+    cur.close()
+    put_conn(conn)
+    
+    # No data at all - default forecast
+    if not snapshots:
+        return {
+            "forecast_occupancy": 50.0,
+            "forecast_adr_min": 1000.0,
+            "forecast_adr_max": 1500.0,
+            "forecast_revpar": 500.0,
+            "confidence": 30,
+            "method": "Default (No Data)"
+        }
+    
+    latest = snapshots[0]
+    occupancy = latest["occupancy"]
+    adr = latest["adr"]
+    historical_months = len(snapshots)
+    
+    # Parse target month
+    target_year = int(target_month[:4])
+    target_month_num = int(target_month[5:7])
+    
+    # Get same month from previous years
+    same_month_historical = []
+    for s in snapshots:
+        if s["period_start"] and s["period_start"][:7] == target_month:
+            same_month_historical.append(s)
+    
+    # =========================================================
+    # BRANCH 1: Has historical data for same month last year
+    # =========================================================
+    if len(same_month_historical) >= 1:
+        avg_occ = sum(s["occupancy"] for s in same_month_historical) / len(same_month_historical)
+        avg_adr = sum(s["adr"] for s in same_month_historical) / len(same_month_historical)
+        
+        # Calculate YoY trend if 2+ years available
+        if len(same_month_historical) >= 2:
+            yoy_occ = (same_month_historical[0]["occupancy"] - same_month_historical[1]["occupancy"]) / max(1, same_month_historical[1]["occupancy"])
+            yoy_adr = (same_month_historical[0]["adr"] - same_month_historical[1]["adr"]) / max(1, same_month_historical[1]["adr"])
+            # Cap YoY impact
+            yoy_occ = max(-0.15, min(0.2, yoy_occ))
+            yoy_adr = max(-0.1, min(0.15, yoy_adr))
+            forecast_occ = avg_occ * (1 + yoy_occ)
+            forecast_adr = avg_adr * (1 + yoy_adr)
+        else:
+            forecast_occ = avg_occ
+            forecast_adr = avg_adr
+        
+        confidence = 85
+        method = "Seasonal (Branch 1)"
+        
+    # =========================================================
+    # BRANCH 2: 90+ days of data (3+ months)
+    # =========================================================
+    elif historical_months >= 3:
+        sorted_snapshots = sorted(snapshots, key=lambda x: x["created_at"])
+        # Calculate monthly trend
+        occ_trend = (sorted_snapshots[-1]["occupancy"] - sorted_snapshots[0]["occupancy"]) / max(1, len(sorted_snapshots))
+        adr_trend = (sorted_snapshots[-1]["adr"] - sorted_snapshots[0]["adr"]) / max(1, len(sorted_snapshots))
+        
+        forecast_occ = occupancy + occ_trend
+        forecast_adr = adr + adr_trend
+        
+        confidence = 75
+        method = "Trend-based (Branch 2)"
+        
+    # =========================================================
+    # BRANCH 3: 30-90 days of data (1-3 months)
+    # =========================================================
+    elif historical_months >= 1:
+        # Use current with slight adjustment
+        forecast_occ = occupancy
+        forecast_adr = adr
+        
+        confidence = 60
+        method = "Moving Average (Branch 3)"
+        
+    # =========================================================
+    # BRANCH 4: Limited data fallback
+    # =========================================================
+    else:
+        forecast_occ = occupancy if occupancy > 0 else 50
+        forecast_adr = adr if adr > 0 else 1200
+        confidence = 45
+        method = "Limited Data (Branch 4)"
+    
+    # Ensure reasonable ranges
+    forecast_occ = max(10, min(95, forecast_occ))
+    forecast_adr = max(500, min(5000, forecast_adr))
+    
+    # Calculate RevPAR
+    forecast_revpar = (forecast_occ / 100) * forecast_adr
+    
     return {
-        "forecast_occupancy": float(round(occupancy, 1)),
-        "forecast_adr_min": float(round(adr * 0.97, 0)),
-        "forecast_adr_max": float(round(adr * 1.03, 0)),
+        "forecast_occupancy": float(round(forecast_occ, 1)),
+        "forecast_adr_min": float(round(forecast_adr * 0.9, 0)),
+        "forecast_adr_max": float(round(forecast_adr * 1.1, 0)),
+        "forecast_revpar": float(round(forecast_revpar, 0)),
+        "confidence": confidence,
+        "method": method
     }
 
 
-def generate_commentary(kpis: dict) -> Optional[str]:
+def generate_commentary(kpis: dict, forecast: dict = None) -> Optional[str]:
     if _openai_client is None:
         return None
+
+    forecast_text = ""
+    if forecast:
+        forecast_text = f"""
+Forecast for next period:
+- Expected Occupancy: {forecast['forecast_occupancy']}%
+- ADR Range: {forecast['forecast_adr_min']} - {forecast['forecast_adr_max']}
+- Method: {forecast.get('method', 'Standard')}
+- Confidence: {forecast.get('confidence', 70)}%
+"""
 
     prompt = f"""
 You are a hotel revenue analyst.
 Explain the performance factually and concisely.
 
-Occupancy: {kpis['occupancy']}%
-ADR: {kpis['adr']}
-RevPAR: {kpis['revpar']}
-Room Revenue: {kpis['room_revenue']}
-
+Current Performance:
+- Occupancy: {kpis['occupancy']}%
+- ADR: {kpis['adr']}
+- RevPAR: {kpis['revpar']}
+- Room Revenue: {kpis['room_revenue']}
+{forecast_text}
 Structure:
 1. Executive summary
-2. Change driver
+2. Key driver
 3. Forecast outlook
+Keep it under 150 words.
 """
     try:
         resp = _openai_client.responses.create(
-            model="gpt-5",
+            model="gpt-4o-mini",
             input=prompt,
             temperature=0.2,
             max_output_tokens=250
@@ -487,8 +617,20 @@ def calculate_and_store(
     perf_df["room_revenue"] = perf_df["room_revenue"].fillna(0).astype(float)
 
     kpis = compute_snapshot_kpis(perf_df, payload.rooms_available)
-    fc = simple_forecast(kpis["occupancy"], kpis["adr"])
-    commentary = generate_commentary(kpis)
+    
+    # USE 4-BRANCH FORECAST
+    target_month = payload.period_start[:7] if payload.period_start else None
+    if target_month:
+        fc = four_branch_forecast(payload.hotel_id, target_month, payload.rooms_available)
+    else:
+        # Fallback
+        fc = {
+            "forecast_occupancy": kpis["occupancy"],
+            "forecast_adr_min": kpis["adr"] * 0.97,
+            "forecast_adr_max": kpis["adr"] * 1.03,
+        }
+    
+    commentary = generate_commentary(kpis, fc)
 
     snapshot_id = str(uuid.uuid4())
 
@@ -553,7 +695,26 @@ def calculate_and_store(
     cur.close()
     put_conn(conn)
 
-    return {"status": "stored", "snapshot_id": snapshot_id}
+    return {"status": "stored", "snapshot_id": snapshot_id, "forecast": fc}
+
+
+# =========================================================
+# NEW: Forecast for any future month (Rate Intelligence)
+# =========================================================
+
+@app.post("/forecast_future_month")
+def forecast_future_month(
+    hotel_id: str = Body(...),
+    target_month: str = Body(...),
+    rooms_available: int = Body(...),
+    x_owner_token: str = Header(..., alias="X-Owner-Token"),
+):
+    """Get 4-branch forecast for any future month - used by Rate Intelligence"""
+    owner = get_owner_by_token(x_owner_token)
+    verify_hotel_ownership(owner["owner_id"], hotel_id)
+    
+    forecast = four_branch_forecast(hotel_id, target_month, rooms_available)
+    return forecast
 
 
 @app.get("/hotel_dashboard/{hotel_id}")
