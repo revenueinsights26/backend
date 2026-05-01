@@ -129,6 +129,66 @@ def init_db():
         )
     """)
     
+    # =========================================================
+    # RATE SHOP TABLES
+    # =========================================================
+    
+    # Create rate_shop_properties table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rate_shop_properties (
+            id SERIAL PRIMARY KEY,
+            property_name VARCHAR(255) NOT NULL,
+            area VARCHAR(100),
+            property_type VARCHAR(50),
+            is_active BOOLEAN DEFAULT true,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Create rate_shop_weekly_data table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rate_shop_weekly_data (
+            id SERIAL PRIMARY KEY,
+            property_id INTEGER REFERENCES rate_shop_properties(id),
+            week_start_date DATE NOT NULL,
+            rate_wk1 DECIMAL(10,2),
+            rate_wk2 DECIMAL(10,2),
+            rate_wk3 DECIMAL(10,2),
+            rate_wk4 DECIMAL(10,2),
+            sold_out_pct INTEGER,
+            min_stay INTEGER,
+            review_score DECIMAL(3,1),
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(property_id, week_start_date)
+        )
+    """)
+    
+    # Insert default properties if they don't exist
+    cur.execute("SELECT COUNT(*) FROM rate_shop_properties")
+    count = cur.fetchone()[0]
+    
+    if count == 0:
+        properties = [
+            ('Sunshine B&B', 'Ellipse', 'B&B'),
+            ('Waterfall Lodge', 'Ellipse', 'Lodge'),
+            ('Rose Inn', 'Ellipse', 'Inn'),
+            ('Midrand Manor', 'Ellipse', 'Manor'),
+            ('Garden View', 'Ellipse', 'B&B'),
+            ('Waterfall Heights', 'Ellipse', 'Lodge'),
+            ('The Crest Retreat', 'Ellipse', 'B&B'),
+            ('Maple Court', 'Ellipse', 'Guesthouse'),
+            ('Summit B&B', 'Ellipse', 'B&B'),
+            ('Lavender Place', 'Ellipse', 'B&B'),
+            ('Cityscape Inn', 'Ellipse', 'Inn'),
+            ('The Pebble Nest', 'Ellipse', 'Guesthouse')
+        ]
+        for prop in properties:
+            cur.execute("""
+                INSERT INTO rate_shop_properties (property_name, area, property_type)
+                VALUES (%s, %s, %s)
+            """, prop)
+    
     conn.commit()
     cur.close()
     put_conn(conn)
@@ -820,3 +880,265 @@ def daily_by_snapshot(
     put_conn(conn)
 
     return {"hotel_id": hotel_id, "snapshot_id": snapshot_id, "performance": perf_rows, "compset": comp_rows}
+
+
+# =========================================================
+# RATE SHOP MODULE - Full endpoints
+# =========================================================
+
+class WeeklyDataEntry(BaseModel):
+    week_start_date: str
+    data: List[dict]
+
+@app.post("/api/rate-shop/weekly-data")
+def save_weekly_data(
+    payload: WeeklyDataEntry,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
+    if x_api_key != correct_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    saved = 0
+    for item in payload.data:
+        cur.execute("""
+            INSERT INTO rate_shop_weekly_data 
+            (property_id, week_start_date, rate_wk1, rate_wk2, rate_wk3, rate_wk4, sold_out_pct, min_stay, review_score, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (property_id, week_start_date) 
+            DO UPDATE SET 
+                rate_wk1 = EXCLUDED.rate_wk1,
+                rate_wk2 = EXCLUDED.rate_wk2,
+                rate_wk3 = EXCLUDED.rate_wk3,
+                rate_wk4 = EXCLUDED.rate_wk4,
+                sold_out_pct = EXCLUDED.sold_out_pct,
+                min_stay = EXCLUDED.min_stay,
+                review_score = EXCLUDED.review_score,
+                notes = EXCLUDED.notes,
+                created_at = CURRENT_TIMESTAMP
+        """, (
+            item["property_id"],
+            payload.week_start_date,
+            item.get("rate_wk1"),
+            item.get("rate_wk2"),
+            item.get("rate_wk3"),
+            item.get("rate_wk4"),
+            item.get("sold_out_pct"),
+            item.get("min_stay"),
+            item.get("review_score"),
+            item.get("notes")
+        ))
+        saved += 1
+    
+    conn.commit()
+    cur.close()
+    put_conn(conn)
+    
+    return {"success": True, "saved_count": saved}
+
+
+@app.get("/api/rate-shop/available-weeks")
+def get_available_weeks():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT DISTINCT week_start_date 
+        FROM rate_shop_weekly_data 
+        ORDER BY week_start_date DESC
+    """)
+    weeks = [row["week_start_date"].isoformat() for row in cur.fetchall()]
+    cur.close()
+    put_conn(conn)
+    return weeks
+
+
+@app.get("/api/rate-shop/properties")
+def get_properties():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT id, property_name, area, property_type 
+        FROM rate_shop_properties 
+        WHERE is_active = true 
+        ORDER BY property_name
+    """)
+    props = cur.fetchall()
+    cur.close()
+    put_conn(conn)
+    return props
+
+
+@app.get("/api/rate-shop/dashboard-data")
+def get_dashboard_data(
+    week_start_date: Optional[str] = None,
+):
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # If no date provided, get the latest week
+    if not week_start_date:
+        cur.execute("""
+            SELECT DISTINCT week_start_date 
+            FROM rate_shop_weekly_data 
+            ORDER BY week_start_date DESC 
+            LIMIT 1
+        """)
+        latest = cur.fetchone()
+        if not latest:
+            cur.close()
+            put_conn(conn)
+            return {"current_week": None}
+        week_start_date = latest["week_start_date"]
+    
+    # Get previous week
+    cur.execute("""
+        SELECT DISTINCT week_start_date 
+        FROM rate_shop_weekly_data 
+        WHERE week_start_date < %s 
+        ORDER BY week_start_date DESC 
+        LIMIT 1
+    """, (week_start_date,))
+    prev = cur.fetchone()
+    prev_date = prev["week_start_date"] if prev else None
+    
+    # Get current week data with property names
+    cur.execute("""
+        SELECT 
+            p.id, p.property_name, p.area, p.property_type,
+            w.rate_wk1, w.rate_wk2, w.rate_wk3, w.rate_wk4,
+            w.sold_out_pct, w.min_stay, w.review_score
+        FROM rate_shop_weekly_data w
+        JOIN rate_shop_properties p ON w.property_id = p.id
+        WHERE w.week_start_date = %s AND p.is_active = true
+        ORDER BY p.property_name
+    """, (week_start_date,))
+    current_data = cur.fetchall()
+    
+    # Get previous week data for comparison
+    prev_data = {}
+    if prev_date:
+        cur.execute("""
+            SELECT p.property_name, w.rate_wk4
+            FROM rate_shop_weekly_data w
+            JOIN rate_shop_properties p ON w.property_id = p.id
+            WHERE w.week_start_date = %s
+        """, (prev_date,))
+        for row in cur.fetchall():
+            prev_data[row["property_name"]] = row["rate_wk4"]
+    
+    cur.close()
+    put_conn(conn)
+    
+    if not current_data:
+        return {"current_week": None}
+    
+    # Calculate metrics
+    current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"]]
+    avg_rate = sum(current_rates) / len(current_rates) if current_rates else 0
+    median_rate = sorted(current_rates)[len(current_rates)//2] if current_rates else 0
+    
+    # Calculate vs previous week
+    prev_rates = [prev_data.get(r["property_name"], 0) for r in current_data]
+    prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and prev_rates[0] else avg_rate
+    avg_change_pct = ((avg_rate - prev_avg) / prev_avg * 100) if prev_avg > 0 else 0
+    
+    high_demand_count = sum(1 for r in current_data if (r["sold_out_pct"] or 0) >= 70)
+    
+    # Fast movers
+    fast_movers = []
+    for i, r in enumerate(current_data):
+        prev_rate = prev_data.get(r["property_name"])
+        if prev_rate and r["rate_wk4"]:
+            change = r["rate_wk4"] - prev_rate
+            change_pct = (change / prev_rate * 100)
+            fast_movers.append({
+                "name": r["property_name"],
+                "rate": r["rate_wk4"],
+                "change": change,
+                "change_pct": change_pct
+            })
+    fast_movers.sort(key=lambda x: abs(x["change"]), reverse=True)
+    fast_movers = fast_movers[:5]
+    
+    # Calculate 4-week trends (using rate_wk1 vs rate_wk4)
+    four_week_trends = []
+    for r in current_data:
+        if r["rate_wk1"] and r["rate_wk4"] and r["rate_wk1"] > 0:
+            change_pct = ((r["rate_wk4"] - r["rate_wk1"]) / r["rate_wk1"] * 100)
+            four_week_trends.append({
+                "name": r["property_name"],
+                "rate": r["rate_wk4"],
+                "change_pct": change_pct
+            })
+    four_week_trends.sort(key=lambda x: x["change_pct"], reverse=True)
+    
+    # Build main table
+    main_table = []
+    for r in current_data:
+        prev_rate = prev_data.get(r["property_name"])
+        change = r["rate_wk4"] - prev_rate if prev_rate else 0
+        change_pct = (change / prev_rate * 100) if prev_rate and prev_rate > 0 else 0
+        
+        status = "Stable"
+        if change_pct > 10:
+            status = "Up fast"
+        elif change_pct < -10:
+            status = "Down fast"
+        
+        main_table.append({
+            "property": r["property_name"],
+            "last_week": prev_rate or 0,
+            "this_week": r["rate_wk4"] or 0,
+            "change_rand": change,
+            "change_pct": change_pct,
+            "sold_out": r["sold_out_pct"] or 0,
+            "status": status
+        })
+    
+    # Sort by absolute change
+    main_table.sort(key=lambda x: abs(x["change_rand"]), reverse=True)
+    
+    # Intelligence insights
+    insights = []
+    fast_risers = sum(1 for m in main_table if m["change_pct"] > 10)
+    if fast_risers >= 2:
+        insights.append(f"{fast_risers} properties raised prices over 10% this week — market is heating up.")
+    
+    if high_demand_count >= 4:
+        insights.append(f"{high_demand_count} of {len(current_data)} properties are at ≥70% sold-out rate — high demand period.")
+    
+    # Top 3 premium
+    top_3_avg = sum(sorted(current_rates, reverse=True)[:3]) / 3 if len(current_rates) >= 3 else avg_rate
+    premium_pct = ((top_3_avg - avg_rate) / avg_rate * 100) if avg_rate > 0 else 0
+    if premium_pct > 30:
+        insights.append(f"Top-tier properties command a {round(premium_pct)}% premium over the market average.")
+    
+    # Rate cutters
+    cutters = [m for m in main_table if m["change_pct"] < -10]
+    for cutter in cutters[:1]:
+        insights.append(f"{cutter['property']} is cutting rates — potential opportunity to gain share.")
+    
+    # Weekend recommendation
+    if high_demand_count >= 4:
+        insights.append("Recommended action: Review Fri/Sat pricing — top properties show 70%+ sold-out on weekends.")
+    
+    market_heat = "Warming up" if fast_risers >= 2 else "Stable"
+    
+    return {
+        "current_week": {
+            "week_start_date": week_start_date,
+            "avg_rate": round(avg_rate, 2),
+            "avg_rate_change_pct": round(avg_change_pct, 1),
+            "median_rate": round(median_rate, 2),
+            "high_demand_count": high_demand_count,
+            "total_properties": len(current_data),
+            "market_heat": market_heat,
+            "fast_movers": fast_movers,
+            "four_week_trends": four_week_trends,
+            "main_table": main_table,
+            "insights": insights
+        }
+    }
