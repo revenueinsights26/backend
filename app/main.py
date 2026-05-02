@@ -1142,3 +1142,72 @@ def get_dashboard_data(
             "insights": insights
         }
     }
+
+# =========================================================
+# RATE SHOP ENDPOINT - AUTO-CREATE PROPERTIES (add to main.py)
+# =========================================================
+
+@app.post("/api/rate-shop/weekly-data")
+def save_rate_shop_data(
+    payload: dict,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
+    if x_api_key != correct_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    week_start_date = payload.get("week_start_date")
+    data_list = payload.get("data", [])
+    
+    saved = 0
+    for item in data_list:
+        property_name = item.get("property_name")
+        if not property_name:
+            continue
+        
+        # Auto-create property if not exists
+        cur.execute("SELECT id FROM rate_shop_properties WHERE property_name = %s", (property_name,))
+        existing = cur.fetchone()
+        
+        if existing:
+            property_id = existing[0]
+        else:
+            cur.execute("""
+                INSERT INTO rate_shop_properties (property_name, area, property_type, is_active)
+                VALUES (%s, %s, %s, true)
+                RETURNING id
+            """, (property_name, item.get("area", "Waterfall"), item.get("property_type", "Apartment")))
+            property_id = cur.fetchone()[0]
+        
+        # Save weekly data
+        cur.execute("""
+            INSERT INTO rate_shop_weekly_data 
+            (property_id, week_start_date, rate_avg, rate_min, rate_max, sold_out_days, total_days_with_data)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (property_id, week_start_date) 
+            DO UPDATE SET 
+                rate_avg = EXCLUDED.rate_avg,
+                rate_min = EXCLUDED.rate_min,
+                rate_max = EXCLUDED.rate_max,
+                sold_out_days = EXCLUDED.sold_out_days,
+                total_days_with_data = EXCLUDED.total_days_with_data,
+                created_at = CURRENT_TIMESTAMP
+        """, (
+            property_id,
+            week_start_date,
+            item.get("rate_avg"),
+            item.get("rate_min"),
+            item.get("rate_max"),
+            item.get("sold_out_days"),
+            item.get("total_days_with_data")
+        ))
+        saved += 1
+    
+    conn.commit()
+    cur.close()
+    put_conn(conn)
+    
+    return {"success": True, "saved_count": saved}
