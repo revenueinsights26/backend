@@ -130,14 +130,14 @@ def init_db():
     """)
     
     # =========================================================
-    # RATE SHOP TABLES
+    # RATE SHOP TABLES (new, separate from existing system)
     # =========================================================
     
     # Create rate_shop_properties table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rate_shop_properties (
             id SERIAL PRIMARY KEY,
-            property_name VARCHAR(255) NOT NULL,
+            property_name VARCHAR(255) NOT NULL UNIQUE,
             area VARCHAR(100),
             property_type VARCHAR(50),
             is_active BOOLEAN DEFAULT true,
@@ -149,45 +149,18 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rate_shop_weekly_data (
             id SERIAL PRIMARY KEY,
-            property_id INTEGER REFERENCES rate_shop_properties(id),
+            property_id INTEGER REFERENCES rate_shop_properties(id) ON DELETE CASCADE,
             week_start_date DATE NOT NULL,
-            rate_wk1 DECIMAL(10,2),
-            rate_wk2 DECIMAL(10,2),
-            rate_wk3 DECIMAL(10,2),
-            rate_wk4 DECIMAL(10,2),
-            sold_out_pct INTEGER,
-            min_stay INTEGER,
-            review_score DECIMAL(3,1),
-            notes TEXT,
+            rate_avg DECIMAL(10,2),
+            rate_min DECIMAL(10,2),
+            rate_max DECIMAL(10,2),
+            sold_out_days INTEGER,
+            total_days_with_data INTEGER,
+            raw_data JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(property_id, week_start_date)
         )
     """)
-    
-    # Insert default properties if they don't exist
-    cur.execute("SELECT COUNT(*) FROM rate_shop_properties")
-    count = cur.fetchone()[0]
-    
-    if count == 0:
-        properties = [
-            ('Sunshine B&B', 'Ellipse', 'B&B'),
-            ('Waterfall Lodge', 'Ellipse', 'Lodge'),
-            ('Rose Inn', 'Ellipse', 'Inn'),
-            ('Midrand Manor', 'Ellipse', 'Manor'),
-            ('Garden View', 'Ellipse', 'B&B'),
-            ('Waterfall Heights', 'Ellipse', 'Lodge'),
-            ('The Crest Retreat', 'Ellipse', 'B&B'),
-            ('Maple Court', 'Ellipse', 'Guesthouse'),
-            ('Summit B&B', 'Ellipse', 'B&B'),
-            ('Lavender Place', 'Ellipse', 'B&B'),
-            ('Cityscape Inn', 'Ellipse', 'Inn'),
-            ('The Pebble Nest', 'Ellipse', 'Guesthouse')
-        ]
-        for prop in properties:
-            cur.execute("""
-                INSERT INTO rate_shop_properties (property_name, area, property_type)
-                VALUES (%s, %s, %s)
-            """, prop)
     
     conn.commit()
     cur.close()
@@ -242,7 +215,7 @@ class RateIntelResponse(BaseModel):
 
 
 # -------------------------------------------------
-# Auth helpers
+# Auth helpers (Revenue Insights)
 # -------------------------------------------------
 
 def get_owner_by_token(token: str):
@@ -361,19 +334,13 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
     adr = latest["adr"]
     historical_months = len(snapshots)
     
-    # Parse target month
-    target_year = int(target_month[:4])
-    target_month_num = int(target_month[5:7])
-    
     # Get same month from previous years
     same_month_historical = []
     for s in snapshots:
         if s["period_start"] and s["period_start"][:7] == target_month:
             same_month_historical.append(s)
     
-    # =========================================================
     # BRANCH 1: Has historical data for same month last year
-    # =========================================================
     if len(same_month_historical) >= 1:
         avg_occ = sum(s["occupancy"] for s in same_month_historical) / len(same_month_historical)
         avg_adr = sum(s["adr"] for s in same_month_historical) / len(same_month_historical)
@@ -382,7 +349,6 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
         if len(same_month_historical) >= 2:
             yoy_occ = (same_month_historical[0]["occupancy"] - same_month_historical[1]["occupancy"]) / max(1, same_month_historical[1]["occupancy"])
             yoy_adr = (same_month_historical[0]["adr"] - same_month_historical[1]["adr"]) / max(1, same_month_historical[1]["adr"])
-            # Cap YoY impact
             yoy_occ = max(-0.15, min(0.2, yoy_occ))
             yoy_adr = max(-0.1, min(0.15, yoy_adr))
             forecast_occ = avg_occ * (1 + yoy_occ)
@@ -394,12 +360,9 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
         confidence = 85
         method = "Seasonal (Branch 1)"
         
-    # =========================================================
     # BRANCH 2: 90+ days of data (3+ months)
-    # =========================================================
     elif historical_months >= 3:
         sorted_snapshots = sorted(snapshots, key=lambda x: x["created_at"])
-        # Calculate monthly trend
         occ_trend = (sorted_snapshots[-1]["occupancy"] - sorted_snapshots[0]["occupancy"]) / max(1, len(sorted_snapshots))
         adr_trend = (sorted_snapshots[-1]["adr"] - sorted_snapshots[0]["adr"]) / max(1, len(sorted_snapshots))
         
@@ -409,20 +372,14 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
         confidence = 75
         method = "Trend-based (Branch 2)"
         
-    # =========================================================
     # BRANCH 3: 30-90 days of data (1-3 months)
-    # =========================================================
     elif historical_months >= 1:
-        # Use current with slight adjustment
         forecast_occ = occupancy
         forecast_adr = adr
-        
         confidence = 60
         method = "Moving Average (Branch 3)"
         
-    # =========================================================
     # BRANCH 4: Limited data fallback
-    # =========================================================
     else:
         forecast_occ = occupancy if occupancy > 0 else 50
         forecast_adr = adr if adr > 0 else 1200
@@ -609,7 +566,7 @@ async def admin_clients():
 
 
 # -------------------------------------------------
-# Core endpoints
+# Core endpoints (Revenue Insights)
 # -------------------------------------------------
 
 @app.get("/")
@@ -678,12 +635,10 @@ def calculate_and_store(
 
     kpis = compute_snapshot_kpis(perf_df, payload.rooms_available)
     
-    # USE 4-BRANCH FORECAST
     target_month = payload.period_start[:7] if payload.period_start else None
     if target_month:
         fc = four_branch_forecast(payload.hotel_id, target_month, payload.rooms_available)
     else:
-        # Fallback
         fc = {
             "forecast_occupancy": kpis["occupancy"],
             "forecast_adr_min": kpis["adr"] * 0.97,
@@ -757,10 +712,6 @@ def calculate_and_store(
 
     return {"status": "stored", "snapshot_id": snapshot_id, "forecast": fc}
 
-
-# =========================================================
-# NEW: Forecast for any future month (Rate Intelligence)
-# =========================================================
 
 @app.post("/forecast_future_month")
 def forecast_future_month(
@@ -883,7 +834,7 @@ def daily_by_snapshot(
 
 
 # =========================================================
-# RATE SHOP MODULE - Full endpoints
+# RATE SHOP MODULE - NEW ENDPOINTS (auto-create properties)
 # =========================================================
 
 class WeeklyDataEntry(BaseModel):
@@ -904,32 +855,48 @@ def save_weekly_data(
     
     saved = 0
     for item in payload.data:
+        property_name = item.get("property_name")
+        if not property_name:
+            continue
+        
+        # Check if property exists — if not, auto-create it
+        cur.execute("SELECT id FROM rate_shop_properties WHERE property_name = %s", (property_name,))
+        existing = cur.fetchone()
+        
+        if existing:
+            property_id = existing[0]
+        else:
+            # Auto-create new property (no rejection)
+            cur.execute("""
+                INSERT INTO rate_shop_properties (property_name, area, property_type, is_active)
+                VALUES (%s, %s, %s, true)
+                RETURNING id
+            """, (property_name, item.get("area", "Waterfall"), item.get("property_type", "Apartment")))
+            property_id = cur.fetchone()[0]
+        
+        # Save weekly data
         cur.execute("""
             INSERT INTO rate_shop_weekly_data 
-            (property_id, week_start_date, rate_wk1, rate_wk2, rate_wk3, rate_wk4, sold_out_pct, min_stay, review_score, notes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (property_id, week_start_date, rate_avg, rate_min, rate_max, sold_out_days, total_days_with_data, raw_data)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (property_id, week_start_date) 
             DO UPDATE SET 
-                rate_wk1 = EXCLUDED.rate_wk1,
-                rate_wk2 = EXCLUDED.rate_wk2,
-                rate_wk3 = EXCLUDED.rate_wk3,
-                rate_wk4 = EXCLUDED.rate_wk4,
-                sold_out_pct = EXCLUDED.sold_out_pct,
-                min_stay = EXCLUDED.min_stay,
-                review_score = EXCLUDED.review_score,
-                notes = EXCLUDED.notes,
+                rate_avg = EXCLUDED.rate_avg,
+                rate_min = EXCLUDED.rate_min,
+                rate_max = EXCLUDED.rate_max,
+                sold_out_days = EXCLUDED.sold_out_days,
+                total_days_with_data = EXCLUDED.total_days_with_data,
+                raw_data = EXCLUDED.raw_data,
                 created_at = CURRENT_TIMESTAMP
         """, (
-            item["property_id"],
+            property_id,
             payload.week_start_date,
-            item.get("rate_wk1"),
-            item.get("rate_wk2"),
-            item.get("rate_wk3"),
-            item.get("rate_wk4"),
-            item.get("sold_out_pct"),
-            item.get("min_stay"),
-            item.get("review_score"),
-            item.get("notes")
+            item.get("rate_avg"),
+            item.get("rate_min"),
+            item.get("rate_max"),
+            item.get("sold_out_days"),
+            item.get("total_days_with_data"),
+            json.dumps(item.get("raw_data", {}))
         ))
         saved += 1
     
@@ -960,9 +927,8 @@ def get_properties():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
-        SELECT id, property_name, area, property_type 
+        SELECT id, property_name, area, property_type, is_active
         FROM rate_shop_properties 
-        WHERE is_active = true 
         ORDER BY property_name
     """)
     props = cur.fetchall()
@@ -1008,8 +974,7 @@ def get_dashboard_data(
     cur.execute("""
         SELECT 
             p.id, p.property_name, p.area, p.property_type,
-            w.rate_wk1, w.rate_wk2, w.rate_wk3, w.rate_wk4,
-            w.sold_out_pct, w.min_stay, w.review_score
+            w.rate_avg, w.rate_min, w.rate_max, w.sold_out_days, w.total_days_with_data
         FROM rate_shop_weekly_data w
         JOIN rate_shop_properties p ON w.property_id = p.id
         WHERE w.week_start_date = %s AND p.is_active = true
@@ -1021,13 +986,13 @@ def get_dashboard_data(
     prev_data = {}
     if prev_date:
         cur.execute("""
-            SELECT p.property_name, w.rate_wk4
+            SELECT p.property_name, w.rate_avg
             FROM rate_shop_weekly_data w
             JOIN rate_shop_properties p ON w.property_id = p.id
             WHERE w.week_start_date = %s
         """, (prev_date,))
         for row in cur.fetchall():
-            prev_data[row["property_name"]] = row["rate_wk4"]
+            prev_data[row["property_name"]] = row["rate_avg"]
     
     cur.close()
     put_conn(conn)
@@ -1036,7 +1001,7 @@ def get_dashboard_data(
         return {"current_week": None}
     
     # Calculate metrics
-    current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"]]
+    current_rates = [float(r["rate_avg"]) for r in current_data if r["rate_avg"]]
     avg_rate = sum(current_rates) / len(current_rates) if current_rates else 0
     median_rate = sorted(current_rates)[len(current_rates)//2] if current_rates else 0
     
@@ -1045,41 +1010,29 @@ def get_dashboard_data(
     prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and prev_rates[0] else avg_rate
     avg_change_pct = ((avg_rate - prev_avg) / prev_avg * 100) if prev_avg > 0 else 0
     
-    high_demand_count = sum(1 for r in current_data if (r["sold_out_pct"] or 0) >= 70)
+    high_demand_count = sum(1 for r in current_data if (r["sold_out_days"] or 0) >= 5)
     
     # Fast movers
     fast_movers = []
-    for i, r in enumerate(current_data):
+    for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
-        if prev_rate and r["rate_wk4"]:
-            change = r["rate_wk4"] - prev_rate
+        if prev_rate and r["rate_avg"]:
+            change = r["rate_avg"] - prev_rate
             change_pct = (change / prev_rate * 100)
             fast_movers.append({
                 "name": r["property_name"],
-                "rate": r["rate_wk4"],
+                "rate": r["rate_avg"],
                 "change": change,
                 "change_pct": change_pct
             })
     fast_movers.sort(key=lambda x: abs(x["change"]), reverse=True)
     fast_movers = fast_movers[:5]
     
-    # Calculate 4-week trends (using rate_wk1 vs rate_wk4)
-    four_week_trends = []
-    for r in current_data:
-        if r["rate_wk1"] and r["rate_wk4"] and r["rate_wk1"] > 0:
-            change_pct = ((r["rate_wk4"] - r["rate_wk1"]) / r["rate_wk1"] * 100)
-            four_week_trends.append({
-                "name": r["property_name"],
-                "rate": r["rate_wk4"],
-                "change_pct": change_pct
-            })
-    four_week_trends.sort(key=lambda x: x["change_pct"], reverse=True)
-    
     # Build main table
     main_table = []
     for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
-        change = r["rate_wk4"] - prev_rate if prev_rate else 0
+        change = r["rate_avg"] - prev_rate if prev_rate else 0
         change_pct = (change / prev_rate * 100) if prev_rate and prev_rate > 0 else 0
         
         status = "Stable"
@@ -1088,17 +1041,18 @@ def get_dashboard_data(
         elif change_pct < -10:
             status = "Down fast"
         
+        sold_out_pct = round((r["sold_out_days"] or 0) / 7 * 100) if r["sold_out_days"] else 0
+        
         main_table.append({
             "property": r["property_name"],
             "last_week": prev_rate or 0,
-            "this_week": r["rate_wk4"] or 0,
+            "this_week": r["rate_avg"] or 0,
             "change_rand": change,
             "change_pct": change_pct,
-            "sold_out": r["sold_out_pct"] or 0,
+            "sold_out": sold_out_pct,
             "status": status
         })
     
-    # Sort by absolute change
     main_table.sort(key=lambda x: abs(x["change_rand"]), reverse=True)
     
     # Intelligence insights
@@ -1108,7 +1062,7 @@ def get_dashboard_data(
         insights.append(f"{fast_risers} properties raised prices over 10% this week — market is heating up.")
     
     if high_demand_count >= 4:
-        insights.append(f"{high_demand_count} of {len(current_data)} properties are at ≥70% sold-out rate — high demand period.")
+        insights.append(f"{high_demand_count} of {len(current_data)} properties are at high occupancy — demand period.")
     
     # Top 3 premium
     top_3_avg = sum(sorted(current_rates, reverse=True)[:3]) / 3 if len(current_rates) >= 3 else avg_rate
@@ -1121,9 +1075,8 @@ def get_dashboard_data(
     for cutter in cutters[:1]:
         insights.append(f"{cutter['property']} is cutting rates — potential opportunity to gain share.")
     
-    # Weekend recommendation
     if high_demand_count >= 4:
-        insights.append("Recommended action: Review Fri/Sat pricing — top properties show 70%+ sold-out on weekends.")
+        insights.append("Recommended action: Review Fri/Sat pricing — top properties show strong weekend demand.")
     
     market_heat = "Warming up" if fast_risers >= 2 else "Stable"
     
@@ -1137,7 +1090,6 @@ def get_dashboard_data(
             "total_properties": len(current_data),
             "market_heat": market_heat,
             "fast_movers": fast_movers,
-            "four_week_trends": four_week_trends,
             "main_table": main_table,
             "insights": insights
         }
