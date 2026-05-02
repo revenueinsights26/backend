@@ -31,6 +31,7 @@ if os.getenv("ENVIRONMENT") == "production":
 else:
     app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
 
+# CORS - Allow all origins (critical for frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -833,7 +834,7 @@ def daily_by_snapshot(
 
 
 # =========================================================
-# RATE SHOP MODULE - COMPLETE ENDPOINTS (Auto-create)
+# RATE SHOP MODULE - COMPLETE ENDPOINTS (Auto-create + OPTIONS)
 # =========================================================
 
 @app.get("/api/rate-shop/available-weeks")
@@ -864,6 +865,12 @@ def get_properties():
     cur.close()
     put_conn(conn)
     return props
+
+
+# OPTIONS handler for CORS preflight (FIXES 405 ERROR)
+@app.options("/api/rate-shop/weekly-data")
+async def options_weekly_data():
+    return {}
 
 
 @app.post("/api/rate-shop/weekly-data")
