@@ -31,7 +31,6 @@ if os.getenv("ENVIRONMENT") == "production":
 else:
     app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
 
-# CORS - Allow all origins (critical for frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -134,11 +133,10 @@ def init_db():
     # RATE SHOP TABLES
     # =========================================================
     
-    # Create rate_shop_properties table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rate_shop_properties (
             id SERIAL PRIMARY KEY,
-            property_name VARCHAR(255) NOT NULL UNIQUE,
+            property_name VARCHAR(255) NOT NULL,
             area VARCHAR(100),
             property_type VARCHAR(50),
             is_active BOOLEAN DEFAULT true,
@@ -146,17 +144,19 @@ def init_db():
         )
     """)
     
-    # Create rate_shop_weekly_data table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rate_shop_weekly_data (
             id SERIAL PRIMARY KEY,
-            property_id INTEGER REFERENCES rate_shop_properties(id) ON DELETE CASCADE,
+            property_id INTEGER REFERENCES rate_shop_properties(id),
             week_start_date DATE NOT NULL,
-            rate_avg DECIMAL(10,2),
-            rate_min DECIMAL(10,2),
-            rate_max DECIMAL(10,2),
-            sold_out_days INTEGER,
-            total_days_with_data INTEGER,
+            rate_wk1 DECIMAL(10,2),
+            rate_wk2 DECIMAL(10,2),
+            rate_wk3 DECIMAL(10,2),
+            rate_wk4 DECIMAL(10,2),
+            sold_out_pct INTEGER,
+            min_stay INTEGER,
+            review_score DECIMAL(3,1),
+            notes TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(property_id, week_start_date)
         )
@@ -298,15 +298,6 @@ def compute_snapshot_kpis(perf_df: pd.DataFrame, rooms_available: int) -> dict:
 # =========================================================
 
 def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int) -> dict:
-    """
-    4-branch forecast for any future month - works even with limited data
-    Branch 1: Seasonal (has same month last year)
-    Branch 2: Trend-based (90+ days of history)
-    Branch 3: Moving average (30-90 days)
-    Branch 4: Limited data fallback
-    """
-    
-    # Get historical snapshots for this hotel
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
@@ -318,7 +309,6 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
     cur.close()
     put_conn(conn)
     
-    # No data at all - default forecast
     if not snapshots:
         return {
             "forecast_occupancy": 50.0,
@@ -334,18 +324,18 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
     adr = latest["adr"]
     historical_months = len(snapshots)
     
-    # Get same month from previous years
+    target_year = int(target_month[:4])
+    target_month_num = int(target_month[5:7])
+    
     same_month_historical = []
     for s in snapshots:
         if s["period_start"] and s["period_start"][:7] == target_month:
             same_month_historical.append(s)
     
-    # BRANCH 1: Has historical data for same month last year
     if len(same_month_historical) >= 1:
         avg_occ = sum(s["occupancy"] for s in same_month_historical) / len(same_month_historical)
         avg_adr = sum(s["adr"] for s in same_month_historical) / len(same_month_historical)
         
-        # Calculate YoY trend if 2+ years available
         if len(same_month_historical) >= 2:
             yoy_occ = (same_month_historical[0]["occupancy"] - same_month_historical[1]["occupancy"]) / max(1, same_month_historical[1]["occupancy"])
             yoy_adr = (same_month_historical[0]["adr"] - same_month_historical[1]["adr"]) / max(1, same_month_historical[1]["adr"])
@@ -360,37 +350,29 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
         confidence = 85
         method = "Seasonal (Branch 1)"
         
-    # BRANCH 2: 90+ days of data (3+ months)
     elif historical_months >= 3:
         sorted_snapshots = sorted(snapshots, key=lambda x: x["created_at"])
         occ_trend = (sorted_snapshots[-1]["occupancy"] - sorted_snapshots[0]["occupancy"]) / max(1, len(sorted_snapshots))
         adr_trend = (sorted_snapshots[-1]["adr"] - sorted_snapshots[0]["adr"]) / max(1, len(sorted_snapshots))
-        
         forecast_occ = occupancy + occ_trend
         forecast_adr = adr + adr_trend
-        
         confidence = 75
         method = "Trend-based (Branch 2)"
         
-    # BRANCH 3: 30-90 days of data (1-3 months)
     elif historical_months >= 1:
         forecast_occ = occupancy
         forecast_adr = adr
         confidence = 60
         method = "Moving Average (Branch 3)"
         
-    # BRANCH 4: Limited data fallback
     else:
         forecast_occ = occupancy if occupancy > 0 else 50
         forecast_adr = adr if adr > 0 else 1200
         confidence = 45
         method = "Limited Data (Branch 4)"
     
-    # Ensure reasonable ranges
     forecast_occ = max(10, min(95, forecast_occ))
     forecast_adr = max(500, min(5000, forecast_adr))
-    
-    # Calculate RevPAR
     forecast_revpar = (forecast_occ / 100) * forecast_adr
     
     return {
@@ -720,10 +702,8 @@ def forecast_future_month(
     rooms_available: int = Body(...),
     x_owner_token: str = Header(..., alias="X-Owner-Token"),
 ):
-    """Get 4-branch forecast for any future month - used by Rate Intelligence"""
     owner = get_owner_by_token(x_owner_token)
     verify_hotel_ownership(owner["owner_id"], hotel_id)
-    
     forecast = four_branch_forecast(hotel_id, target_month, rooms_available)
     return forecast
 
@@ -834,8 +814,129 @@ def daily_by_snapshot(
 
 
 # =========================================================
-# RATE SHOP MODULE - COMPLETE ENDPOINTS (Auto-create + OPTIONS)
+# RATE SHOP MODULE
 # =========================================================
+
+class WeeklyDataEntry(BaseModel):
+    week_start_date: str
+    data: List[dict]
+
+class WeeklyUploadByName(BaseModel):
+    week_start_date: str
+    data: List[dict]  # each item: { property_name, area, property_type, rate_wk4, sold_out_pct }
+
+
+@app.post("/api/rate-shop/weekly-data")
+def save_weekly_data(
+    payload: WeeklyDataEntry,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
+    if x_api_key != correct_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    conn = get_conn()
+    cur = conn.cursor()
+    saved = 0
+
+    for item in payload.data:
+        cur.execute("""
+            INSERT INTO rate_shop_weekly_data 
+            (property_id, week_start_date, rate_wk1, rate_wk2, rate_wk3, rate_wk4, sold_out_pct, min_stay, review_score, notes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (property_id, week_start_date) 
+            DO UPDATE SET 
+                rate_wk1 = EXCLUDED.rate_wk1,
+                rate_wk2 = EXCLUDED.rate_wk2,
+                rate_wk3 = EXCLUDED.rate_wk3,
+                rate_wk4 = EXCLUDED.rate_wk4,
+                sold_out_pct = EXCLUDED.sold_out_pct,
+                min_stay = EXCLUDED.min_stay,
+                review_score = EXCLUDED.review_score,
+                notes = EXCLUDED.notes,
+                created_at = CURRENT_TIMESTAMP
+        """, (
+            item["property_id"],
+            payload.week_start_date,
+            item.get("rate_wk1"),
+            item.get("rate_wk2"),
+            item.get("rate_wk3"),
+            item.get("rate_wk4"),
+            item.get("sold_out_pct"),
+            item.get("min_stay"),
+            item.get("review_score"),
+            item.get("notes")
+        ))
+        saved += 1
+    
+    conn.commit()
+    cur.close()
+    put_conn(conn)
+    return {"success": True, "saved_count": saved}
+
+
+@app.post("/api/rate-shop/upload-by-name")
+def upload_by_name(
+    payload: WeeklyUploadByName,
+    x_api_key: str = Header(..., alias="X-API-Key"),
+):
+    """
+    Accepts property names directly from Lighthouse upload.
+    Auto-creates any new property not yet in rate_shop_properties.
+    No need to know property IDs in advance.
+    """
+    correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
+    if x_api_key != correct_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    saved = 0
+
+    for item in payload.data:
+        prop_name = item.get("property_name", "").strip()
+        if not prop_name:
+            continue
+
+        # Get existing property or create new one
+        cur.execute(
+            "SELECT id FROM rate_shop_properties WHERE LOWER(property_name) = LOWER(%s)",
+            (prop_name,)
+        )
+        row = cur.fetchone()
+        if row:
+            prop_id = row[0]
+        else:
+            cur.execute(
+                """INSERT INTO rate_shop_properties (property_name, area, property_type, is_active)
+                   VALUES (%s, %s, %s, true) RETURNING id""",
+                (prop_name, item.get("area", "Ellipse"), item.get("property_type", "Competitor"))
+            )
+            prop_id = cur.fetchone()[0]
+
+        # Upsert the weekly rate
+        cur.execute("""
+            INSERT INTO rate_shop_weekly_data
+                (property_id, week_start_date, rate_wk4, sold_out_pct)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (property_id, week_start_date)
+            DO UPDATE SET
+                rate_wk4     = EXCLUDED.rate_wk4,
+                sold_out_pct = EXCLUDED.sold_out_pct,
+                created_at   = CURRENT_TIMESTAMP
+        """, (
+            prop_id,
+            payload.week_start_date,
+            item.get("rate_wk4"),
+            item.get("sold_out_pct"),
+        ))
+        saved += 1
+
+    conn.commit()
+    cur.close()
+    put_conn(conn)
+    return {"success": True, "saved_count": saved}
+
 
 @app.get("/api/rate-shop/available-weeks")
 def get_available_weeks():
@@ -857,8 +958,9 @@ def get_properties():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("""
-        SELECT id, property_name, area, property_type, is_active
+        SELECT id, property_name, area, property_type 
         FROM rate_shop_properties 
+        WHERE is_active = true 
         ORDER BY property_name
     """)
     props = cur.fetchall()
@@ -867,86 +969,11 @@ def get_properties():
     return props
 
 
-# OPTIONS handler for CORS preflight (FIXES 405 ERROR)
-@app.options("/api/rate-shop/weekly-data")
-async def options_weekly_data():
-    return {}
-
-
-@app.post("/api/rate-shop/weekly-data")
-def save_weekly_data(
-    payload: dict,
-    x_api_key: str = Header(..., alias="X-API-Key"),
-):
-    correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
-    if x_api_key != correct_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
-    conn = get_conn()
-    cur = conn.cursor()
-    
-    week_start_date = payload.get("week_start_date")
-    data_list = payload.get("data", [])
-    
-    saved = 0
-    for item in data_list:
-        property_name = item.get("property_name")
-        if not property_name:
-            continue
-        
-        # Auto-create property if not exists
-        cur.execute("SELECT id FROM rate_shop_properties WHERE property_name = %s", (property_name,))
-        existing = cur.fetchone()
-        
-        if existing:
-            property_id = existing[0]
-        else:
-            cur.execute("""
-                INSERT INTO rate_shop_properties (property_name, area, property_type, is_active)
-                VALUES (%s, %s, %s, true)
-                RETURNING id
-            """, (property_name, item.get("area", "Waterfall"), item.get("property_type", "Apartment")))
-            property_id = cur.fetchone()[0]
-        
-        # Save weekly data
-        cur.execute("""
-            INSERT INTO rate_shop_weekly_data 
-            (property_id, week_start_date, rate_avg, rate_min, rate_max, sold_out_days, total_days_with_data)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (property_id, week_start_date) 
-            DO UPDATE SET 
-                rate_avg = EXCLUDED.rate_avg,
-                rate_min = EXCLUDED.rate_min,
-                rate_max = EXCLUDED.rate_max,
-                sold_out_days = EXCLUDED.sold_out_days,
-                total_days_with_data = EXCLUDED.total_days_with_data,
-                created_at = CURRENT_TIMESTAMP
-        """, (
-            property_id,
-            week_start_date,
-            item.get("rate_avg"),
-            item.get("rate_min"),
-            item.get("rate_max"),
-            item.get("sold_out_days"),
-            item.get("total_days_with_data")
-        ))
-        saved += 1
-    
-    conn.commit()
-    cur.close()
-    put_conn(conn)
-    
-    return {"success": True, "saved_count": saved}
-
-
 @app.get("/api/rate-shop/dashboard-data")
-def get_dashboard_data(
-    week_start_date: Optional[str] = None,
-):
+def get_dashboard_data(week_start_date: Optional[str] = None):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
-    # If no date provided, get the latest week
     if not week_start_date:
         cur.execute("""
             SELECT DISTINCT week_start_date 
@@ -961,7 +988,6 @@ def get_dashboard_data(
             return {"current_week": None}
         week_start_date = latest["week_start_date"]
     
-    # Get previous week
     cur.execute("""
         SELECT DISTINCT week_start_date 
         FROM rate_shop_weekly_data 
@@ -972,11 +998,11 @@ def get_dashboard_data(
     prev = cur.fetchone()
     prev_date = prev["week_start_date"] if prev else None
     
-    # Get current week data with property names
     cur.execute("""
         SELECT 
             p.id, p.property_name, p.area, p.property_type,
-            w.rate_avg, w.rate_min, w.rate_max, w.sold_out_days, w.total_days_with_data
+            w.rate_wk1, w.rate_wk2, w.rate_wk3, w.rate_wk4,
+            w.sold_out_pct, w.min_stay, w.review_score
         FROM rate_shop_weekly_data w
         JOIN rate_shop_properties p ON w.property_id = p.id
         WHERE w.week_start_date = %s AND p.is_active = true
@@ -984,17 +1010,16 @@ def get_dashboard_data(
     """, (week_start_date,))
     current_data = cur.fetchall()
     
-    # Get previous week averages for comparison
-    prev_avgs = {}
+    prev_data = {}
     if prev_date:
         cur.execute("""
-            SELECT p.property_name, w.rate_avg
+            SELECT p.property_name, w.rate_wk4
             FROM rate_shop_weekly_data w
             JOIN rate_shop_properties p ON w.property_id = p.id
             WHERE w.week_start_date = %s
         """, (prev_date,))
         for row in cur.fetchall():
-            prev_avgs[row["property_name"]] = row["rate_avg"]
+            prev_data[row["property_name"]] = row["rate_wk4"]
     
     cur.close()
     put_conn(conn)
@@ -1002,101 +1027,102 @@ def get_dashboard_data(
     if not current_data:
         return {"current_week": None}
     
-    # Calculate market averages
-    current_rates = [r["rate_avg"] for r in current_data if r["rate_avg"]]
+    current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"]]
     avg_rate = sum(current_rates) / len(current_rates) if current_rates else 0
     median_rate = sorted(current_rates)[len(current_rates)//2] if current_rates else 0
     
-    # Calculate week-over-week change
-    prev_rates = [prev_avgs.get(r["property_name"], 0) for r in current_data]
-    prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and any(prev_rates) else avg_rate
+    prev_rates = [prev_data.get(r["property_name"], 0) for r in current_data]
+    prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and prev_rates[0] else avg_rate
     avg_change_pct = ((avg_rate - prev_avg) / prev_avg * 100) if prev_avg > 0 else 0
     
-    # High demand count (sold out >= 4 days out of 7)
-    high_demand_count = sum(1 for r in current_data if (r["sold_out_days"] or 0) >= 4)
+    high_demand_count = sum(1 for r in current_data if (r["sold_out_pct"] or 0) >= 70)
     
-    # Fast movers
     fast_movers = []
     for r in current_data:
-        prev_rate = prev_avgs.get(r["property_name"])
-        if prev_rate and r["rate_avg"]:
-            change = r["rate_avg"] - prev_rate
-            change_pct = (change / prev_rate * 100)
+        prev_rate = prev_data.get(r["property_name"])
+        if prev_rate and r["rate_wk4"]:
+            change = float(r["rate_wk4"]) - float(prev_rate)
+            change_pct = (change / float(prev_rate) * 100)
             fast_movers.append({
                 "name": r["property_name"],
-                "rate": r["rate_avg"],
-                "change": change,
-                "change_pct": change_pct
+                "rate": float(r["rate_wk4"]),
+                "change": round(change, 2),
+                "change_pct": round(change_pct, 1)
             })
     fast_movers.sort(key=lambda x: abs(x["change"]), reverse=True)
     fast_movers = fast_movers[:5]
     
-    # 4-week trends (simplified: we only have one week per record, so no real 4-week trend here)
     four_week_trends = []
-    for r in current_data[:10]:
-        four_week_trends.append({
-            "name": r["property_name"],
-            "rate": r["rate_avg"] or 0,
-            "change_pct": 0  # would need 4 weeks of data
-        })
+    for r in current_data:
+        if r["rate_wk1"] and r["rate_wk4"] and float(r["rate_wk1"]) > 0:
+            change_pct = ((float(r["rate_wk4"]) - float(r["rate_wk1"])) / float(r["rate_wk1"]) * 100)
+            four_week_trends.append({
+                "name": r["property_name"],
+                "rate": float(r["rate_wk4"]),
+                "wk1": float(r["rate_wk1"]),
+                "change_pct": round(change_pct, 1)
+            })
+    four_week_trends.sort(key=lambda x: x["change_pct"], reverse=True)
     
-    # Build main table
     main_table = []
     for r in current_data:
-        prev_rate = prev_avgs.get(r["property_name"])
-        change = r["rate_avg"] - prev_rate if prev_rate else 0
-        change_pct = (change / prev_rate * 100) if prev_rate and prev_rate > 0 else 0
+        prev_rate = prev_data.get(r["property_name"])
+        this_week = float(r["rate_wk4"]) if r["rate_wk4"] else 0
+        change = this_week - float(prev_rate) if prev_rate else 0
+        change_pct = (change / float(prev_rate) * 100) if prev_rate and float(prev_rate) > 0 else 0
         
-        status = "Stable"
         if change_pct > 10:
             status = "Up fast"
         elif change_pct < -10:
             status = "Down fast"
-        
-        sold_out_pct = round((r["sold_out_days"] or 0) / 7 * 100) if r["sold_out_days"] else 0
+        else:
+            status = "Stable"
         
         main_table.append({
             "property": r["property_name"],
-            "last_week": prev_rate or 0,
-            "this_week": r["rate_avg"] or 0,
-            "change_rand": change,
-            "change_pct": change_pct,
-            "sold_out": sold_out_pct,
+            "property_type": r["property_type"] or "",
+            "last_week": round(float(prev_rate), 2) if prev_rate else 0,
+            "this_week": round(this_week, 2),
+            "change_rand": round(change, 2),
+            "change_pct": round(change_pct, 1),
+            "sold_out": r["sold_out_pct"] or 0,
             "status": status
         })
     
     main_table.sort(key=lambda x: abs(x["change_rand"]), reverse=True)
     
-    # Generate insights
     insights = []
     fast_risers = sum(1 for m in main_table if m["change_pct"] > 10)
+    fast_fallers = sum(1 for m in main_table if m["change_pct"] < -10)
+
     if fast_risers >= 2:
         insights.append(f"{fast_risers} properties raised prices over 10% this week — market is heating up.")
-    
+    if fast_fallers >= 2:
+        insights.append(f"{fast_fallers} properties cut rates this week — possible demand softness.")
     if high_demand_count >= 4:
-        insights.append(f"{high_demand_count} of {len(current_data)} properties are at high occupancy — demand period.")
+        insights.append(f"{high_demand_count} of {len(current_data)} properties are at ≥70% sold-out rate — high demand period.")
     
-    # Top 3 premium calculation
-    if len(current_rates) >= 3:
-        top_3_avg = sum(sorted(current_rates, reverse=True)[:3]) / 3
-        premium_pct = ((top_3_avg - avg_rate) / avg_rate * 100) if avg_rate > 0 else 0
-        if premium_pct > 30:
-            insights.append(f"Top-tier properties command a {round(premium_pct)}% premium over the market average.")
+    top_3_avg = sum(sorted(current_rates, reverse=True)[:3]) / 3 if len(current_rates) >= 3 else avg_rate
+    premium_pct = ((top_3_avg - avg_rate) / avg_rate * 100) if avg_rate > 0 else 0
+    if premium_pct > 30:
+        insights.append(f"Top-tier properties command a {round(premium_pct)}% premium over the market average.")
     
-    # Rate cutters
     cutters = [m for m in main_table if m["change_pct"] < -10]
     for cutter in cutters[:1]:
         insights.append(f"{cutter['property']} is cutting rates — potential opportunity to gain share.")
     
     if high_demand_count >= 4:
-        insights.append("Recommended action: Review Fri/Sat pricing — top properties show strong weekend demand.")
+        insights.append("Recommended action: Review Fri/Sat pricing — top properties show 70%+ sold-out on weekends.")
+
+    if not insights:
+        insights.append("Market rates are stable this week — no significant movements detected.")
     
-    market_heat = "Warming up" if fast_risers >= 2 else "Stable"
+    market_heat = "Warming up" if fast_risers >= 2 else ("Cooling down" if fast_fallers >= 2 else "Stable")
     
     return {
         "current_week": {
-            "week_start_date": week_start_date,
-            "prev_week_date": prev_date.isoformat() if prev_date else None,
+            "week_start_date": str(week_start_date),
+            "prev_week_date": str(prev_date) if prev_date else None,
             "avg_rate": round(avg_rate, 2),
             "avg_rate_change_pct": round(avg_change_pct, 1),
             "median_rate": round(median_rate, 2),
