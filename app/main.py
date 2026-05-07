@@ -993,12 +993,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
     if not week_start_date:
-        cur.execute("""
-            SELECT DISTINCT week_start_date 
-            FROM rate_shop_weekly_data 
-            ORDER BY week_start_date DESC 
-            LIMIT 1
-        """)
+        cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data ORDER BY week_start_date DESC LIMIT 1")
         latest = cur.fetchone()
         if not latest:
             cur.close()
@@ -1006,26 +1001,25 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
             return {"current_week": None}
         week_start_date = latest["week_start_date"]
     
-    cur.execute("""
-        SELECT DISTINCT week_start_date 
-        FROM rate_shop_weekly_data 
-        WHERE week_start_date < %s 
-        ORDER BY week_start_date DESC 
-        LIMIT 1
-    """, (week_start_date,))
+    cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data WHERE week_start_date < %s ORDER BY week_start_date DESC LIMIT 1", (week_start_date,))
     prev = cur.fetchone()
     prev_date = prev["week_start_date"] if prev else None
     
     cur.execute("""
-        SELECT 
-            p.id, p.property_name, p.area, p.property_type,
-            w.rate_wk4, w.sold_out_pct
+        SELECT p.id, p.property_name, p.area, p.property_type,
+               w.rate_wk4, w.sold_out_pct
         FROM rate_shop_weekly_data w
         JOIN rate_shop_properties p ON w.property_id = p.id
         WHERE w.week_start_date = %s AND p.is_active = true
         ORDER BY p.property_name
     """, (week_start_date,))
     current_data = cur.fetchall()
+    
+    # IMPORTANT: Return early if no data for this week
+    if not current_data:
+        cur.close()
+        put_conn(conn)
+        return {"current_week": None}
     
     prev_data = {}
     if prev_date:
@@ -1041,15 +1035,17 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur.close()
     put_conn(conn)
     
-    if not current_data:
+    # Safely calculate rates only if we have data
+    current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"] is not None]
+    
+    if not current_rates:
         return {"current_week": None}
     
-    current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"]]
-    avg_rate = sum(current_rates) / len(current_rates) if current_rates else 0
-    median_rate = sorted(current_rates)[len(current_rates)//2] if current_rates else 0
+    avg_rate = sum(current_rates) / len(current_rates)
+    median_rate = sorted(current_rates)[len(current_rates)//2]
     
     prev_rates = [prev_data.get(r["property_name"], 0) for r in current_data]
-    prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and prev_rates[0] else avg_rate
+    prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and any(prev_rates) else avg_rate
     avg_change_pct = ((avg_rate - prev_avg) / prev_avg * 100) if prev_avg > 0 else 0
     
     high_demand_count = sum(1 for r in current_data if (r["sold_out_pct"] or 0) >= 70)
