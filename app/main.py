@@ -31,6 +31,7 @@ if os.getenv("ENVIRONMENT") == "production":
 else:
     app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
 
+# CORS - Allow all origins (critical for frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -323,9 +324,6 @@ def four_branch_forecast(hotel_id: str, target_month: str, rooms_available: int)
     occupancy = latest["occupancy"]
     adr = latest["adr"]
     historical_months = len(snapshots)
-    
-    target_year = int(target_month[:4])
-    target_month_num = int(target_month[5:7])
     
     same_month_historical = []
     for s in snapshots:
@@ -814,7 +812,7 @@ def daily_by_snapshot(
 
 
 # =========================================================
-# RATE SHOP MODULE
+# RATE SHOP MODULE - COMPLETE ENDPOINTS
 # =========================================================
 
 class WeeklyDataEntry(BaseModel):
@@ -824,6 +822,58 @@ class WeeklyDataEntry(BaseModel):
 class WeeklyUploadByName(BaseModel):
     week_start_date: str
     data: List[dict]  # each item: { property_name, area, property_type, rate_wk4, sold_out_pct }
+
+
+# OPTIONS handlers for CORS preflight
+@app.options("/api/rate-shop/weekly-data")
+async def options_weekly_data():
+    return {}
+
+@app.options("/api/rate-shop/upload-by-name")
+async def options_upload_by_name():
+    return {}
+
+@app.options("/api/rate-shop/available-weeks")
+async def options_available_weeks():
+    return {}
+
+@app.options("/api/rate-shop/properties")
+async def options_properties():
+    return {}
+
+@app.options("/api/rate-shop/dashboard-data")
+async def options_dashboard_data():
+    return {}
+
+
+@app.get("/api/rate-shop/available-weeks")
+def get_available_weeks():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT DISTINCT week_start_date 
+        FROM rate_shop_weekly_data 
+        ORDER BY week_start_date DESC
+    """)
+    weeks = [row["week_start_date"].isoformat() for row in cur.fetchall()]
+    cur.close()
+    put_conn(conn)
+    return weeks
+
+
+@app.get("/api/rate-shop/properties")
+def get_properties():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT id, property_name, area, property_type, is_active
+        FROM rate_shop_properties 
+        ORDER BY property_name
+    """)
+    props = cur.fetchall()
+    cur.close()
+    put_conn(conn)
+    return props
 
 
 @app.post("/api/rate-shop/weekly-data")
@@ -883,7 +933,6 @@ def upload_by_name(
     """
     Accepts property names directly from Lighthouse upload.
     Auto-creates any new property not yet in rate_shop_properties.
-    No need to know property IDs in advance.
     """
     correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
     if x_api_key != correct_key:
@@ -938,37 +987,6 @@ def upload_by_name(
     return {"success": True, "saved_count": saved}
 
 
-@app.get("/api/rate-shop/available-weeks")
-def get_available_weeks():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
-        SELECT DISTINCT week_start_date 
-        FROM rate_shop_weekly_data 
-        ORDER BY week_start_date DESC
-    """)
-    weeks = [row["week_start_date"].isoformat() for row in cur.fetchall()]
-    cur.close()
-    put_conn(conn)
-    return weeks
-
-
-@app.get("/api/rate-shop/properties")
-def get_properties():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
-        SELECT id, property_name, area, property_type 
-        FROM rate_shop_properties 
-        WHERE is_active = true 
-        ORDER BY property_name
-    """)
-    props = cur.fetchall()
-    cur.close()
-    put_conn(conn)
-    return props
-
-
 @app.get("/api/rate-shop/dashboard-data")
 def get_dashboard_data(week_start_date: Optional[str] = None):
     conn = get_conn()
@@ -1001,8 +1019,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur.execute("""
         SELECT 
             p.id, p.property_name, p.area, p.property_type,
-            w.rate_wk1, w.rate_wk2, w.rate_wk3, w.rate_wk4,
-            w.sold_out_pct, w.min_stay, w.review_score
+            w.rate_wk4, w.sold_out_pct
         FROM rate_shop_weekly_data w
         JOIN rate_shop_properties p ON w.property_id = p.id
         WHERE w.week_start_date = %s AND p.is_active = true
@@ -1052,18 +1069,6 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     fast_movers.sort(key=lambda x: abs(x["change"]), reverse=True)
     fast_movers = fast_movers[:5]
     
-    four_week_trends = []
-    for r in current_data:
-        if r["rate_wk1"] and r["rate_wk4"] and float(r["rate_wk1"]) > 0:
-            change_pct = ((float(r["rate_wk4"]) - float(r["rate_wk1"])) / float(r["rate_wk1"]) * 100)
-            four_week_trends.append({
-                "name": r["property_name"],
-                "rate": float(r["rate_wk4"]),
-                "wk1": float(r["rate_wk1"]),
-                "change_pct": round(change_pct, 1)
-            })
-    four_week_trends.sort(key=lambda x: x["change_pct"], reverse=True)
-    
     main_table = []
     for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
@@ -1102,18 +1107,6 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     if high_demand_count >= 4:
         insights.append(f"{high_demand_count} of {len(current_data)} properties are at ≥70% sold-out rate — high demand period.")
     
-    top_3_avg = sum(sorted(current_rates, reverse=True)[:3]) / 3 if len(current_rates) >= 3 else avg_rate
-    premium_pct = ((top_3_avg - avg_rate) / avg_rate * 100) if avg_rate > 0 else 0
-    if premium_pct > 30:
-        insights.append(f"Top-tier properties command a {round(premium_pct)}% premium over the market average.")
-    
-    cutters = [m for m in main_table if m["change_pct"] < -10]
-    for cutter in cutters[:1]:
-        insights.append(f"{cutter['property']} is cutting rates — potential opportunity to gain share.")
-    
-    if high_demand_count >= 4:
-        insights.append("Recommended action: Review Fri/Sat pricing — top properties show 70%+ sold-out on weekends.")
-
     if not insights:
         insights.append("Market rates are stable this week — no significant movements detected.")
     
@@ -1130,7 +1123,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
             "total_properties": len(current_data),
             "market_heat": market_heat,
             "fast_movers": fast_movers,
-            "four_week_trends": four_week_trends,
+            "four_week_trends": [],
             "main_table": main_table,
             "insights": insights
         }
