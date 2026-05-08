@@ -31,7 +31,6 @@ if os.getenv("ENVIRONMENT") == "production":
 else:
     app = FastAPI(title="Revenue Insights & Pricing Console", version="2.0")
 
-# CORS - Allow all origins (critical for frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -993,7 +992,12 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
     if not week_start_date:
-        cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data ORDER BY week_start_date DESC LIMIT 1")
+        cur.execute("""
+            SELECT DISTINCT week_start_date 
+            FROM rate_shop_weekly_data 
+            ORDER BY week_start_date DESC 
+            LIMIT 1
+        """)
         latest = cur.fetchone()
         if not latest:
             cur.close()
@@ -1001,13 +1005,20 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
             return {"current_week": None}
         week_start_date = latest["week_start_date"]
     
-    cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data WHERE week_start_date < %s ORDER BY week_start_date DESC LIMIT 1", (week_start_date,))
+    cur.execute("""
+        SELECT DISTINCT week_start_date 
+        FROM rate_shop_weekly_data 
+        WHERE week_start_date < %s 
+        ORDER BY week_start_date DESC 
+        LIMIT 1
+    """, (week_start_date,))
     prev = cur.fetchone()
     prev_date = prev["week_start_date"] if prev else None
     
     cur.execute("""
-        SELECT p.id, p.property_name, p.area, p.property_type,
-               w.rate_wk4, w.sold_out_pct
+        SELECT 
+            p.id, p.property_name, p.area, p.property_type,
+            w.rate_wk4, w.sold_out_pct
         FROM rate_shop_weekly_data w
         JOIN rate_shop_properties p ON w.property_id = p.id
         WHERE w.week_start_date = %s AND p.is_active = true
@@ -1015,7 +1026,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     """, (week_start_date,))
     current_data = cur.fetchall()
     
-    # IMPORTANT: Return early if no data for this week
+    # FIX: Return early if no data for this week (prevents 500 error)
     if not current_data:
         cur.close()
         put_conn(conn)
@@ -1035,7 +1046,6 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur.close()
     put_conn(conn)
     
-    # Safely calculate rates only if we have data
     current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"] is not None]
     
     if not current_rates:
@@ -1064,6 +1074,18 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
             })
     fast_movers.sort(key=lambda x: abs(x["change"]), reverse=True)
     fast_movers = fast_movers[:5]
+    
+    four_week_trends = []
+    for r in current_data:
+        if r.get("rate_wk1") and r.get("rate_wk4") and float(r["rate_wk1"]) > 0:
+            change_pct = ((float(r["rate_wk4"]) - float(r["rate_wk1"])) / float(r["rate_wk1"]) * 100)
+            four_week_trends.append({
+                "name": r["property_name"],
+                "rate": float(r["rate_wk4"]),
+                "wk1": float(r["rate_wk1"]),
+                "change_pct": round(change_pct, 1)
+            })
+    four_week_trends.sort(key=lambda x: x["change_pct"], reverse=True)
     
     main_table = []
     for r in current_data:
@@ -1119,7 +1141,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
             "total_properties": len(current_data),
             "market_heat": market_heat,
             "fast_movers": fast_movers,
-            "four_week_trends": [],
+            "four_week_trends": four_week_trends,
             "main_table": main_table,
             "insights": insights
         }
