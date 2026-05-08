@@ -991,13 +991,12 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     
+    # Clean the date parameter (remove any trailing :1, :2, etc. from frontend)
+    if week_start_date:
+        week_start_date = week_start_date.split(':')[0]
+    
     if not week_start_date:
-        cur.execute("""
-            SELECT DISTINCT week_start_date 
-            FROM rate_shop_weekly_data 
-            ORDER BY week_start_date DESC 
-            LIMIT 1
-        """)
+        cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data ORDER BY week_start_date DESC LIMIT 1")
         latest = cur.fetchone()
         if not latest:
             cur.close()
@@ -1005,20 +1004,13 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
             return {"current_week": None}
         week_start_date = latest["week_start_date"]
     
-    cur.execute("""
-        SELECT DISTINCT week_start_date 
-        FROM rate_shop_weekly_data 
-        WHERE week_start_date < %s 
-        ORDER BY week_start_date DESC 
-        LIMIT 1
-    """, (week_start_date,))
+    cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data WHERE week_start_date < %s ORDER BY week_start_date DESC LIMIT 1", (week_start_date,))
     prev = cur.fetchone()
     prev_date = prev["week_start_date"] if prev else None
     
     cur.execute("""
-        SELECT 
-            p.id, p.property_name, p.area, p.property_type,
-            w.rate_wk4, w.sold_out_pct
+        SELECT p.id, p.property_name, p.area, p.property_type,
+               w.rate_wk4, w.sold_out_pct
         FROM rate_shop_weekly_data w
         JOIN rate_shop_properties p ON w.property_id = p.id
         WHERE w.week_start_date = %s AND p.is_active = true
@@ -1026,7 +1018,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     """, (week_start_date,))
     current_data = cur.fetchall()
     
-    # FIX: Return early if no data for this week (prevents 500 error)
+    # Return early if no data for this week
     if not current_data:
         cur.close()
         put_conn(conn)
@@ -1046,24 +1038,35 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur.close()
     put_conn(conn)
     
+    # Safe calculation - filter out None values
     current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"] is not None]
     
     if not current_rates:
         return {"current_week": None}
     
     avg_rate = sum(current_rates) / len(current_rates)
-    median_rate = sorted(current_rates)[len(current_rates)//2]
+    median_rate = sorted(current_rates)[len(current_rates) // 2]
     
-    prev_rates = [prev_data.get(r["property_name"], 0) for r in current_data]
-    prev_avg = sum(prev_rates) / len(prev_rates) if prev_rates and any(prev_rates) else avg_rate
-    avg_change_pct = ((avg_rate - prev_avg) / prev_avg * 100) if prev_avg > 0 else 0
+    # Safe previous week calculation - handle None values
+    prev_rates = []
+    for r in current_data:
+        val = prev_data.get(r["property_name"])
+        if val is not None:
+            prev_rates.append(float(val))
+    
+    if prev_rates:
+        prev_avg = sum(prev_rates) / len(prev_rates)
+        avg_change_pct = ((avg_rate - prev_avg) / prev_avg * 100) if prev_avg > 0 else 0
+    else:
+        prev_avg = 0
+        avg_change_pct = 0
     
     high_demand_count = sum(1 for r in current_data if (r["sold_out_pct"] or 0) >= 70)
     
     fast_movers = []
     for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
-        if prev_rate and r["rate_wk4"]:
+        if prev_rate is not None and r["rate_wk4"] is not None:
             change = float(r["rate_wk4"]) - float(prev_rate)
             change_pct = (change / float(prev_rate) * 100)
             fast_movers.append({
@@ -1091,8 +1094,12 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
         this_week = float(r["rate_wk4"]) if r["rate_wk4"] else 0
-        change = this_week - float(prev_rate) if prev_rate else 0
-        change_pct = (change / float(prev_rate) * 100) if prev_rate and float(prev_rate) > 0 else 0
+        if prev_rate is not None:
+            change = this_week - float(prev_rate)
+            change_pct = (change / float(prev_rate) * 100) if float(prev_rate) > 0 else 0
+        else:
+            change = 0
+            change_pct = 0
         
         if change_pct > 10:
             status = "Up fast"
@@ -1104,7 +1111,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
         main_table.append({
             "property": r["property_name"],
             "property_type": r["property_type"] or "",
-            "last_week": round(float(prev_rate), 2) if prev_rate else 0,
+            "last_week": round(float(prev_rate), 2) if prev_rate is not None else 0,
             "this_week": round(this_week, 2),
             "change_rand": round(change, 2),
             "change_pct": round(change_pct, 1),
