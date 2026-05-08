@@ -849,11 +849,7 @@ async def options_dashboard_data():
 def get_available_weeks():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
-        SELECT DISTINCT week_start_date 
-        FROM rate_shop_weekly_data 
-        ORDER BY week_start_date DESC
-    """)
+    cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data ORDER BY week_start_date DESC")
     weeks = [row["week_start_date"].isoformat() for row in cur.fetchall()]
     cur.close()
     put_conn(conn)
@@ -864,11 +860,7 @@ def get_available_weeks():
 def get_properties():
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("""
-        SELECT id, property_name, area, property_type, is_active
-        FROM rate_shop_properties 
-        ORDER BY property_name
-    """)
+    cur.execute("SELECT id, property_name, area, property_type, is_active FROM rate_shop_properties ORDER BY property_name")
     props = cur.fetchall()
     cur.close()
     put_conn(conn)
@@ -876,25 +868,18 @@ def get_properties():
 
 
 @app.post("/api/rate-shop/weekly-data")
-def save_weekly_data(
-    payload: WeeklyDataEntry,
-    x_api_key: str = Header(..., alias="X-API-Key"),
-):
+def save_weekly_data(payload: WeeklyDataEntry, x_api_key: str = Header(..., alias="X-API-Key")):
     correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
     if x_api_key != correct_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
-    
     conn = get_conn()
     cur = conn.cursor()
     saved = 0
-
     for item in payload.data:
         cur.execute("""
-            INSERT INTO rate_shop_weekly_data 
-            (property_id, week_start_date, rate_wk1, rate_wk2, rate_wk3, rate_wk4, sold_out_pct, min_stay, review_score, notes)
+            INSERT INTO rate_shop_weekly_data (property_id, week_start_date, rate_wk1, rate_wk2, rate_wk3, rate_wk4, sold_out_pct, min_stay, review_score, notes)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (property_id, week_start_date) 
-            DO UPDATE SET 
+            ON CONFLICT (property_id, week_start_date) DO UPDATE SET
                 rate_wk1 = EXCLUDED.rate_wk1,
                 rate_wk2 = EXCLUDED.rate_wk2,
                 rate_wk3 = EXCLUDED.rate_wk3,
@@ -904,20 +889,8 @@ def save_weekly_data(
                 review_score = EXCLUDED.review_score,
                 notes = EXCLUDED.notes,
                 created_at = CURRENT_TIMESTAMP
-        """, (
-            item["property_id"],
-            payload.week_start_date,
-            item.get("rate_wk1"),
-            item.get("rate_wk2"),
-            item.get("rate_wk3"),
-            item.get("rate_wk4"),
-            item.get("sold_out_pct"),
-            item.get("min_stay"),
-            item.get("review_score"),
-            item.get("notes")
-        ))
+        """, (item["property_id"], payload.week_start_date, item.get("rate_wk1"), item.get("rate_wk2"), item.get("rate_wk3"), item.get("rate_wk4"), item.get("sold_out_pct"), item.get("min_stay"), item.get("review_score"), item.get("notes")))
         saved += 1
-    
     conn.commit()
     cur.close()
     put_conn(conn)
@@ -925,61 +898,33 @@ def save_weekly_data(
 
 
 @app.post("/api/rate-shop/upload-by-name")
-def upload_by_name(
-    payload: WeeklyUploadByName,
-    x_api_key: str = Header(..., alias="X-API-Key"),
-):
-    """
-    Accepts property names directly from Lighthouse upload.
-    Auto-creates any new property not yet in rate_shop_properties.
-    """
+def upload_by_name(payload: WeeklyUploadByName, x_api_key: str = Header(..., alias="X-API-Key")):
     correct_key = os.getenv("RATE_SHOP_PASSWORD", "temp123")
     if x_api_key != correct_key:
         raise HTTPException(status_code=401, detail="Invalid API key")
-
     conn = get_conn()
     cur = conn.cursor()
     saved = 0
-
     for item in payload.data:
         prop_name = item.get("property_name", "").strip()
         if not prop_name:
             continue
-
-        # Get existing property or create new one
-        cur.execute(
-            "SELECT id FROM rate_shop_properties WHERE LOWER(property_name) = LOWER(%s)",
-            (prop_name,)
-        )
+        cur.execute("SELECT id FROM rate_shop_properties WHERE LOWER(property_name) = LOWER(%s)", (prop_name,))
         row = cur.fetchone()
         if row:
             prop_id = row[0]
         else:
-            cur.execute(
-                """INSERT INTO rate_shop_properties (property_name, area, property_type, is_active)
-                   VALUES (%s, %s, %s, true) RETURNING id""",
-                (prop_name, item.get("area", "Ellipse"), item.get("property_type", "Competitor"))
-            )
+            cur.execute("INSERT INTO rate_shop_properties (property_name, area, property_type, is_active) VALUES (%s, %s, %s, true) RETURNING id", (prop_name, item.get("area", "Ellipse"), item.get("property_type", "Competitor")))
             prop_id = cur.fetchone()[0]
-
-        # Upsert the weekly rate
         cur.execute("""
-            INSERT INTO rate_shop_weekly_data
-                (property_id, week_start_date, rate_wk4, sold_out_pct)
+            INSERT INTO rate_shop_weekly_data (property_id, week_start_date, rate_wk4, sold_out_pct)
             VALUES (%s, %s, %s, %s)
-            ON CONFLICT (property_id, week_start_date)
-            DO UPDATE SET
-                rate_wk4     = EXCLUDED.rate_wk4,
+            ON CONFLICT (property_id, week_start_date) DO UPDATE SET
+                rate_wk4 = EXCLUDED.rate_wk4,
                 sold_out_pct = EXCLUDED.sold_out_pct,
-                created_at   = CURRENT_TIMESTAMP
-        """, (
-            prop_id,
-            payload.week_start_date,
-            item.get("rate_wk4"),
-            item.get("sold_out_pct"),
-        ))
+                created_at = CURRENT_TIMESTAMP
+        """, (prop_id, payload.week_start_date, item.get("rate_wk4"), item.get("sold_out_pct")))
         saved += 1
-
     conn.commit()
     cur.close()
     put_conn(conn)
@@ -988,12 +933,12 @@ def upload_by_name(
 
 @app.get("/api/rate-shop/dashboard-data")
 def get_dashboard_data(week_start_date: Optional[str] = None):
+    # Clean the date parameter first (remove :1, %27, etc.)
+    if week_start_date:
+        week_start_date = week_start_date.split(':')[0].split('%')[0]
+    
     conn = get_conn()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # Clean the date parameter (remove any trailing :1, :2, etc. from frontend)
-    if week_start_date:
-        week_start_date = week_start_date.split(':')[0]
     
     if not week_start_date:
         cur.execute("SELECT DISTINCT week_start_date FROM rate_shop_weekly_data ORDER BY week_start_date DESC LIMIT 1")
@@ -1018,7 +963,6 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     """, (week_start_date,))
     current_data = cur.fetchall()
     
-    # Return early if no data for this week
     if not current_data:
         cur.close()
         put_conn(conn)
@@ -1038,8 +982,16 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     cur.close()
     put_conn(conn)
     
-    # Safe calculation - filter out None values
-    current_rates = [float(r["rate_wk4"]) for r in current_data if r["rate_wk4"] is not None]
+    # Safe calculation - filter out None and zero values
+    current_rates = []
+    for r in current_data:
+        if r["rate_wk4"] is not None:
+            try:
+                val = float(r["rate_wk4"])
+                if val > 0:
+                    current_rates.append(val)
+            except (ValueError, TypeError):
+                pass
     
     if not current_rates:
         return {"current_week": None}
@@ -1047,12 +999,17 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     avg_rate = sum(current_rates) / len(current_rates)
     median_rate = sorted(current_rates)[len(current_rates) // 2]
     
-    # Safe previous week calculation - handle None values
+    # Safe previous week calculation - handle None and zero values
     prev_rates = []
     for r in current_data:
         val = prev_data.get(r["property_name"])
         if val is not None:
-            prev_rates.append(float(val))
+            try:
+                pv = float(val)
+                if pv > 0:
+                    prev_rates.append(pv)
+            except (ValueError, TypeError):
+                pass
     
     if prev_rates:
         prev_avg = sum(prev_rates) / len(prev_rates)
@@ -1063,43 +1020,70 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     
     high_demand_count = sum(1 for r in current_data if (r["sold_out_pct"] or 0) >= 70)
     
+    # Fast movers with safe division
     fast_movers = []
     for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
-        if prev_rate is not None and r["rate_wk4"] is not None:
-            change = float(r["rate_wk4"]) - float(prev_rate)
-            change_pct = (change / float(prev_rate) * 100)
-            fast_movers.append({
-                "name": r["property_name"],
-                "rate": float(r["rate_wk4"]),
-                "change": round(change, 2),
-                "change_pct": round(change_pct, 1)
-            })
+        current_rate = r["rate_wk4"]
+        if prev_rate is not None and current_rate is not None:
+            try:
+                prev_float = float(prev_rate)
+                curr_float = float(current_rate)
+                if prev_float > 0:
+                    change = curr_float - prev_float
+                    change_pct = (change / prev_float * 100)
+                    fast_movers.append({
+                        "name": r["property_name"],
+                        "rate": curr_float,
+                        "change": round(change, 2),
+                        "change_pct": round(change_pct, 1)
+                    })
+            except (ValueError, ZeroDivisionError, TypeError):
+                pass
     fast_movers.sort(key=lambda x: abs(x["change"]), reverse=True)
     fast_movers = fast_movers[:5]
     
+    # 4-week trends with safe division
     four_week_trends = []
     for r in current_data:
-        if r.get("rate_wk1") and r.get("rate_wk4") and float(r["rate_wk1"]) > 0:
-            change_pct = ((float(r["rate_wk4"]) - float(r["rate_wk1"])) / float(r["rate_wk1"]) * 100)
-            four_week_trends.append({
-                "name": r["property_name"],
-                "rate": float(r["rate_wk4"]),
-                "wk1": float(r["rate_wk1"]),
-                "change_pct": round(change_pct, 1)
-            })
+        if r.get("rate_wk1") and r.get("rate_wk4"):
+            try:
+                wk1 = float(r["rate_wk1"])
+                wk4 = float(r["rate_wk4"])
+                if wk1 > 0:
+                    change_pct = ((wk4 - wk1) / wk1 * 100)
+                    four_week_trends.append({
+                        "name": r["property_name"],
+                        "rate": wk4,
+                        "wk1": wk1,
+                        "change_pct": round(change_pct, 1)
+                    })
+            except (ValueError, ZeroDivisionError, TypeError):
+                pass
     four_week_trends.sort(key=lambda x: x["change_pct"], reverse=True)
     
+    # Main table with safe division
     main_table = []
     for r in current_data:
         prev_rate = prev_data.get(r["property_name"])
-        this_week = float(r["rate_wk4"]) if r["rate_wk4"] else 0
+        this_week = 0
+        if r["rate_wk4"] is not None:
+            try:
+                this_week = float(r["rate_wk4"])
+            except (ValueError, TypeError):
+                this_week = 0
+        
+        change = 0
+        change_pct = 0
+        
         if prev_rate is not None:
-            change = this_week - float(prev_rate)
-            change_pct = (change / float(prev_rate) * 100) if float(prev_rate) > 0 else 0
-        else:
-            change = 0
-            change_pct = 0
+            try:
+                prev_float = float(prev_rate)
+                if prev_float > 0:
+                    change = this_week - prev_float
+                    change_pct = (change / prev_float * 100)
+            except (ValueError, ZeroDivisionError, TypeError):
+                pass
         
         if change_pct > 10:
             status = "Up fast"
@@ -1111,7 +1095,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
         main_table.append({
             "property": r["property_name"],
             "property_type": r["property_type"] or "",
-            "last_week": round(float(prev_rate), 2) if prev_rate is not None else 0,
+            "last_week": round(float(prev_rate), 2) if prev_rate and float(prev_rate) > 0 else 0,
             "this_week": round(this_week, 2),
             "change_rand": round(change, 2),
             "change_pct": round(change_pct, 1),
@@ -1124,7 +1108,7 @@ def get_dashboard_data(week_start_date: Optional[str] = None):
     insights = []
     fast_risers = sum(1 for m in main_table if m["change_pct"] > 10)
     fast_fallers = sum(1 for m in main_table if m["change_pct"] < -10)
-
+    
     if fast_risers >= 2:
         insights.append(f"{fast_risers} properties raised prices over 10% this week — market is heating up.")
     if fast_fallers >= 2:
