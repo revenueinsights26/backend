@@ -601,6 +601,18 @@ def get_available_weeks():
     return weeks
 
 
+# NEW ENDPOINT ADDED - THIS IS THE ONLY CHANGE TO main.py
+@app.get("/api/rate-shop/available-dates")
+def get_available_dates():
+    conn = get_conn()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT DISTINCT stay_date FROM rate_shop_daily_rates ORDER BY stay_date")
+    dates = [row["stay_date"].isoformat() for row in cur.fetchall()]
+    cur.close()
+    put_conn(conn)
+    return dates
+
+
 @app.get("/api/rate-shop/properties")
 def get_properties():
     conn = get_conn()
